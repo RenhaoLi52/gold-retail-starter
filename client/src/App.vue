@@ -10,6 +10,9 @@ const username = ref('admin')
 const password = ref('123456')
 const userLabel = ref('')
 const isAdmin = ref(false)
+const userStore = ref('')  // v0.19：所属门店名，空=总部
+const userStoreId = ref(0) // 所属门店id，0=总部
+const isHQ = ref(true)     // 总部账号才有入库/退库/调拨视图
 const errMsg = ref('')
 const okMsg = ref('')
 
@@ -113,7 +116,7 @@ interface SDoc {
   docNo: string
   status: string
   totalAmount: number
-  salespersonId: number
+  salespersonIds: number[]
   salespersonName: string
   payments: PayLine[]
   lines: SaleLine[]
@@ -124,7 +127,7 @@ const slEditingId = ref(0)
 const slEditingNo = ref('')
 const slLines = ref<SaleLine[]>([])
 const slInput = ref('')
-const slSalespersonId = ref(0)
+const slSalespersonIds = ref<number[]>([])
 const slPays = ref<PayLine[]>([])
 
 function slReset() {
@@ -132,8 +135,21 @@ function slReset() {
   slEditingNo.value = ''
   slLines.value = []
   slInput.value = ''
-  slSalespersonId.value = 0
+  slSalespersonIds.value = []
   slPays.value = []
+}
+// 多售货员：点名字切换选中，最多3人（v0.20）
+function slToggleSp(id: number) {
+  const i = slSalespersonIds.value.indexOf(id)
+  if (i >= 0) {
+    slSalespersonIds.value.splice(i, 1)
+  } else {
+    if (slSalespersonIds.value.length >= 3) {
+      errMsg.value = '售货员最多3人'
+      return
+    }
+    slSalespersonIds.value.push(id)
+  }
 }
 
 // ===== 组合收款（v0.14） =====
@@ -206,7 +222,7 @@ async function slSave(confirmAfter: boolean) {
   try {
     const r = await api.saleSave({
       id: slEditingId.value,
-      salespersonId: slSalespersonId.value,
+      salespersonIds: slSalespersonIds.value,
       // 完全空白的收款行（没选方式）不上传；选了方式的原样上传让服务端把关
       payments: slPays.value
         .filter(p => p.method)
@@ -271,7 +287,7 @@ function slEdit(d: SDoc) {
   slEditingId.value = d.id
   slEditingNo.value = d.docNo
   slLines.value = d.lines.map(l => ({ ...l }))
-  slSalespersonId.value = d.salespersonId || 0
+  slSalespersonIds.value = [...(d.salespersonIds ?? [])]
   slPays.value = (d.payments ?? []).map(p => ({ ...p }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -731,30 +747,45 @@ const enabledCats = () => dicts.value.category.filter(d => d.enabled)
 const enabledPurities = () => dicts.value.purity.filter(d => d.enabled)
 const enabledPayMethods = () => dicts.value.pay_method.filter(d => d.enabled)
 
-// ===== 售货员档案（v0.14） =====
+// ===== 售货员档案（v0.14，v0.20加门店/角色/抽成） =====
 interface Salesperson {
   id: number
   name: string
   sort: number
   enabled: boolean
+  distributorId: number
+  storeName: string
+  role: string
+  managerRate: number
 }
 const salespersons = ref<Salesperson[]>([])
 const showSps = ref(false)
 const nspName = ref('')
 const nspSort = ref(0)
+const nspStore = ref(0)
+const nspRole = ref('店员')
+const nspRate = ref(0)
 
 async function loadSalespersons() {
   const r = await api.salespersonList()
   salespersons.value = r.list
 }
 const enabledSalespersons = () => salespersons.value.filter(s => s.enabled)
+// 开单只选"本账号所在位置"的售货员（总部账号选总部的，门店账号选本店的）
+const saleSalespersons = () =>
+  salespersons.value.filter(s => s.enabled && s.distributorId === userStoreId.value)
 
 async function createSp() {
   errMsg.value = ''
   try {
-    await api.salespersonCreate(nspName.value, Number(nspSort.value) || 0)
+    await api.salespersonCreate({
+      name: nspName.value, sort: Number(nspSort.value) || 0,
+      distributorId: nspStore.value, role: nspRole.value,
+      managerRate: Number(nspRate.value) || 0,
+    })
     flash(`已新增售货员：${nspName.value}`)
     nspName.value = ''
+    nspRate.value = 0
     await loadSalespersons()
   } catch (e) {
     errMsg.value = (e as Error).message
@@ -768,17 +799,87 @@ async function toggleSp(s: Salesperson) {
     await loadSalespersons()
   } catch (e) {
     errMsg.value = (e as Error).message
+    await loadSalespersons()
   }
 }
 async function saveSp(s: Salesperson) {
   errMsg.value = ''
   try {
-    await api.salespersonUpdate({ id: s.id, name: s.name, sort: Number(s.sort) || 0 })
+    await api.salespersonUpdate({
+      id: s.id, name: s.name, sort: Number(s.sort) || 0,
+      distributorId: s.distributorId, role: s.role,
+      managerRate: Number(s.managerRate) || 0,
+    })
     flash(`售货员资料已保存：${s.name}`)
     await loadSalespersons()
   } catch (e) {
     errMsg.value = (e as Error).message
     await loadSalespersons() // 失败时还原回服务端数据
+  }
+}
+
+// ===== 提成规则（仅管理员，v0.20） =====
+interface CommRule {
+  id: number
+  category: string
+  mode: string
+  calcType: string
+  value: number
+  enabled: boolean
+}
+const commRules = ref<CommRule[]>([])
+const showRules = ref(false)
+const nrCategory = ref('')
+const nrMode = ref('标签价')
+const nrCalc = ref('销售额百分比')
+const nrValue = ref<number | null>(null)
+const calcUnit = (t: string) => t === '销售额百分比' ? '%' : t === '每克固定' ? '元/克' : '元/件'
+
+async function toggleRules() {
+  showRules.value = !showRules.value
+  if (showRules.value) await loadRules()
+}
+async function loadRules() {
+  try {
+    const r = await api.commissionRuleList()
+    commRules.value = r.list
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function createRule() {
+  errMsg.value = ''
+  try {
+    await api.commissionRuleCreate({
+      category: nrCategory.value, mode: nrMode.value,
+      calcType: nrCalc.value, value: Number(nrValue.value) || 0,
+    })
+    flash(`提成规则已新增：${nrCategory.value}×${nrMode.value}`)
+    nrValue.value = null
+    await loadRules()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function saveRule(x: CommRule) {
+  errMsg.value = ''
+  try {
+    await api.commissionRuleUpdate({ id: x.id, calcType: x.calcType, value: Number(x.value) || 0 })
+    flash(`规则已保存：${x.category}×${x.mode}`)
+    await loadRules()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await loadRules()
+  }
+}
+async function toggleRule(x: CommRule) {
+  errMsg.value = ''
+  try {
+    await api.commissionRuleUpdate({ id: x.id, enabled: !x.enabled })
+    flash(`规则已${x.enabled ? '停用' : '启用'}`)
+    await loadRules()
+  } catch (e) {
+    errMsg.value = (e as Error).message
   }
 }
 
@@ -815,6 +916,7 @@ interface User {
   name: string
   status: number
   isAdmin: boolean
+  store: string
   created: string
 }
 const users = ref<User[]>([])
@@ -822,6 +924,7 @@ const showUsers = ref(false)
 const nuUsername = ref('')
 const nuName = ref('')
 const nuPassword = ref('')
+const nuStore = ref(0) // 0=总部
 
 async function toggleUsers() {
   showUsers.value = !showUsers.value
@@ -838,11 +941,12 @@ async function loadUsers() {
 async function createUser() {
   errMsg.value = ''
   try {
-    await api.userCreate(nuUsername.value, nuName.value, nuPassword.value)
+    await api.userCreate(nuUsername.value, nuName.value, nuPassword.value, nuStore.value)
     flash(`已创建用户 ${nuUsername.value}`)
     nuUsername.value = ''
     nuName.value = ''
     nuPassword.value = ''
+    nuStore.value = 0
     await loadUsers()
   } catch (e) {
     errMsg.value = (e as Error).message
@@ -912,6 +1016,9 @@ async function doLogin() {
     setToken(r.token)
     userLabel.value = r.name
     isAdmin.value = !!r.isAdmin
+    userStore.value = r.storeName || ''
+    userStoreId.value = r.storeId || 0
+    isHQ.value = !r.storeId
     logged.value = true
     await refreshAll()
   } catch (e) {
@@ -924,6 +1031,9 @@ function doLogout() {
   logged.value = false
   userLabel.value = ''
   isAdmin.value = false
+  userStore.value = ''
+  userStoreId.value = 0
+  isHQ.value = true
   password.value = ''
 }
 
@@ -935,6 +1045,9 @@ onMounted(async () => {
     const r = await api.me()
     userLabel.value = r.name
     isAdmin.value = !!r.isAdmin
+    userStore.value = r.storeName || ''
+    userStoreId.value = r.storeId || 0
+    isHQ.value = !r.storeId
     logged.value = true
     await refreshAll()
   } catch {
@@ -1091,11 +1204,12 @@ function editDoc(d: Doc) {
 
     <template v-else>
       <p class="hint">
-        当前用户：{{ userLabel }}
+        当前用户：{{ userLabel }}<b v-if="userStore">（{{ userStore }}）</b>
         <button class="mini" @click="showPwd = !showPwd">修改密码</button>
         <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
         <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
         <button v-if="isAdmin" class="mini" @click="showSps = !showSps">售货员</button>
+        <button v-if="isAdmin" class="mini" @click="toggleRules">提成规则</button>
         <button v-if="isAdmin" class="mini" @click="showDists = !showDists">分销商</button>
         <button class="mini" @click="doLogout">退出登录</button>
       </p>
@@ -1141,17 +1255,31 @@ function editDoc(d: Doc) {
         <p class="hint">字典只停用不删除——历史单据和货品引用着这些名字。改名也暂不开放，避免历史数据失去解释。</p>
       </section>
 
-      <!-- 售货员维护（仅管理员可见，v0.14） -->
+      <!-- 售货员维护（仅管理员可见，v0.14；v0.20加门店/角色/抽成） -->
       <section v-if="isAdmin && showSps" class="card">
         <h2>售货员维护</h2>
         <table>
           <thead>
-            <tr><th>姓名</th><th>排序</th><th>状态</th><th>操作</th></tr>
+            <tr><th>姓名</th><th>门店</th><th>角色</th><th>店长抽成%</th><th>排序</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="s in salespersons" :key="s.id">
-              <td><input v-model="s.name" style="width:120px" /></td>
-              <td><input v-model.number="s.sort" type="number" style="width:60px" /></td>
+              <td><input v-model="s.name" style="width:100px" /></td>
+              <td>
+                <select v-model.number="s.distributorId">
+                  <option :value="0">总部</option>
+                  <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+                </select>
+              </td>
+              <td>
+                <select v-model="s.role">
+                  <option>店员</option>
+                  <option>店长</option>
+                </select>
+              </td>
+              <td><input v-model.number="s.managerRate" type="number" step="0.5" style="width:60px"
+                :disabled="s.role !== '店长'" /></td>
+              <td><input v-model.number="s.sort" type="number" style="width:50px" /></td>
               <td>{{ s.enabled ? '在职' : '已停用' }}</td>
               <td>
                 <button class="mini" @click="saveSp(s)">保存</button>
@@ -1163,11 +1291,79 @@ function editDoc(d: Doc) {
           </tbody>
         </table>
         <div class="row">
-          <label>姓名 <input v-model="nspName" /></label>
-          <label>排序 <input v-model.number="nspSort" type="number" style="width:70px" /></label>
+          <label>姓名 <input v-model="nspName" style="width:100px" /></label>
+          <label>门店
+            <select v-model.number="nspStore">
+              <option :value="0">总部</option>
+              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
+          <label>角色
+            <select v-model="nspRole">
+              <option>店员</option>
+              <option>店长</option>
+            </select>
+          </label>
+          <label v-if="nspRole === '店长'">抽成% <input v-model.number="nspRate" type="number" step="0.5" style="width:60px" /></label>
+          <label>排序 <input v-model.number="nspSort" type="number" style="width:60px" /></label>
           <button @click="createSp">新增售货员</button>
         </div>
-        <p class="hint">售货员是销售档案，与登录账号是两回事。单据按编号引用售货员，所以改名是安全的（这点与字典相反）。离职只停用不删除。</p>
+        <p class="hint">每个门店最多一位启用的店长；店长从本店店员每笔提成中抽上面的百分比（店员到手=份额×(1-抽成%)），店长自己卖货按规则全额拿。改门店/角色只影响之后确认的单。</p>
+      </section>
+
+      <!-- 提成规则（仅管理员可见，v0.20） -->
+      <section v-if="isAdmin && showRules" class="card">
+        <h2>提成规则 <button class="mini" @click="loadRules">刷新</button></h2>
+        <table>
+          <thead>
+            <tr><th>大类</th><th>结算方式</th><th>计算方式</th><th>数值</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="x in commRules" :key="x.id">
+              <td>{{ x.category }}</td>
+              <td>{{ x.mode }}</td>
+              <td>
+                <select v-model="x.calcType">
+                  <option>销售额百分比</option>
+                  <option>每克固定</option>
+                  <option>每件固定</option>
+                </select>
+              </td>
+              <td><input v-model.number="x.value" type="number" step="0.1" style="width:80px" /> {{ calcUnit(x.calcType) }}</td>
+              <td>{{ x.enabled ? '启用' : '已停用' }}</td>
+              <td>
+                <button class="mini" @click="saveRule(x)">保存</button>
+                <button :class="['mini', x.enabled ? 'danger' : '']" @click="toggleRule(x)">
+                  {{ x.enabled ? '停用' : '启用' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <label>大类
+            <select v-model="nrCategory">
+              <option value="">— 选择 —</option>
+              <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
+            </select>
+          </label>
+          <label>结算方式
+            <select v-model="nrMode">
+              <option>标签价</option>
+              <option>变金价</option>
+            </select>
+          </label>
+          <label>计算方式
+            <select v-model="nrCalc">
+              <option>销售额百分比</option>
+              <option>每克固定</option>
+              <option>每件固定</option>
+            </select>
+          </label>
+          <label>数值 <input v-model.number="nrValue" type="number" step="0.1" style="width:80px" /> {{ calcUnit(nrCalc) }}</label>
+          <button @click="createRule">新增规则</button>
+        </div>
+        <p class="hint">每个"大类×结算方式"一条规则；没配规则的货没有提成（不报错）。改规则只影响之后确认的单——已入账的提成是确认时刻的快照。</p>
       </section>
 
       <!-- 分销商维护（仅管理员可见，v0.18） -->
@@ -1202,7 +1398,7 @@ function editDoc(d: Doc) {
         <h2>用户管理 <button class="mini" @click="loadUsers">刷新</button></h2>
         <table>
           <thead>
-            <tr><th>用户名</th><th>姓名</th><th>状态</th><th>角色</th><th>创建日期</th><th>操作</th></tr>
+            <tr><th>用户名</th><th>姓名</th><th>状态</th><th>角色</th><th>所属</th><th>创建日期</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="u in users" :key="u.id">
@@ -1210,6 +1406,7 @@ function editDoc(d: Doc) {
               <td>{{ u.name }}</td>
               <td>{{ u.status === 1 ? '启用' : '已禁用' }}</td>
               <td>{{ u.isAdmin ? '管理员' : '店员' }}</td>
+              <td>{{ u.store }}</td>
               <td>{{ u.created }}</td>
               <td>
                 <button v-if="u.status === 1" class="mini danger" @click="setUserStatus(u, 0)">禁用</button>
@@ -1223,6 +1420,12 @@ function editDoc(d: Doc) {
           <label>用户名 <input v-model="nuUsername" placeholder="字母数字下划线" /></label>
           <label>姓名 <input v-model="nuName" /></label>
           <label>初始密码 <input v-model="nuPassword" type="password" /></label>
+          <label>所属
+            <select v-model.number="nuStore">
+              <option :value="0">总部</option>
+              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
           <button @click="createUser">新建用户</button>
         </div>
       </section>
@@ -1300,14 +1503,15 @@ function editDoc(d: Doc) {
             </tr>
           </tbody>
         </table>
-        <!-- 售货员 + 组合收款（v0.14） -->
+        <!-- 售货员（1~3人，点名字选中，整单平分）+ 组合收款 -->
         <div class="row" v-if="slLines.length">
-          <label>售货员
-            <select v-model.number="slSalespersonId">
-              <option :value="0">— 请选择 —</option>
-              <option v-for="s in enabledSalespersons()" :key="s.id" :value="s.id">{{ s.name }}</option>
-            </select>
-          </label>
+          <span>售货员(可多选，整单平分)：</span>
+          <button v-for="s in saleSalespersons()" :key="s.id" class="mini"
+            :style="slSalespersonIds.includes(s.id) ? 'background:#2f7d4f' : ''"
+            @click="slToggleSp(s.id)">
+            {{ s.name }}{{ s.role === '店长' ? '(店长)' : '' }}
+          </button>
+          <span class="hint" v-if="!saleSalespersons().length">（先在"售货员"里给{{ userStore || '总部' }}添加人员）</span>
         </div>
         <template v-if="slLines.length">
           <div class="row" v-for="(p, i) in slPays" :key="i">
@@ -1375,7 +1579,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 调拨单（v0.18） -->
-      <section class="card">
+      <section v-if="isHQ" class="card">
         <h2>
           {{ tfEditingId ? `编辑调拨草稿 ${tfEditingNo}` : '调拨单（分货/退总库/互调）' }}
           <button v-if="tfEditingId" class="mini" @click="tfReset">放弃，新建</button>
@@ -1420,7 +1624,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 调拨单列表 -->
-      <section class="card" v-if="tdocs.length">
+      <section class="card" v-if="isHQ && tdocs.length">
         <h2>调拨单列表（{{ tdocs.length }} 张）</h2>
         <div v-for="d in tdocs" :key="d.id" class="doc">
           <div class="dochead">
@@ -1541,7 +1745,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 开单表单 -->
-      <section class="card">
+      <section v-if="isHQ" class="card">
         <h2>
           {{ editingId ? `编辑草稿 ${editingNo}` : '新建入库单' }}
           <button v-if="editingId" class="mini" @click="resetForm">放弃编辑，新建</button>
@@ -1582,7 +1786,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 单据列表 -->
-      <section class="card">
+      <section v-if="isHQ" class="card">
         <h2>入库单列表（{{ docs.length }} 张） <button class="mini" @click="refreshAll">刷新</button></h2>
         <div v-for="d in docs" :key="d.id" class="doc">
           <div class="dochead">
@@ -1614,7 +1818,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 退库单 -->
-      <section class="card">
+      <section v-if="isHQ" class="card">
         <h2>
           {{ obEditingId ? `编辑退库草稿 ${obEditingNo}` : '新建退库单' }}
           <button v-if="obEditingId" class="mini" @click="obReset">放弃编辑，新建</button>
@@ -1645,7 +1849,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 退库单列表 -->
-      <section class="card" v-if="odocs.length">
+      <section class="card" v-if="isHQ && odocs.length">
         <h2>退库单列表（{{ odocs.length }} 张）</h2>
         <div v-for="d in odocs" :key="d.id" class="doc">
           <div class="dochead">
@@ -1680,7 +1884,7 @@ function editDoc(d: Doc) {
       <section class="card">
         <h2>库存查询</h2>
         <div class="row">
-          <label>位置
+          <label v-if="isHQ">位置
             <select v-model="fLoc" @change="refreshAll">
               <option value="">全部</option>
               <option value="0">总库</option>

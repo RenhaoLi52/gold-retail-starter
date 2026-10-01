@@ -117,14 +117,18 @@ export const api = {
 
   // 售货员档案（读取所有人；增改仅管理员）
   salespersonList: () => request('GET', '/api/salespersons'),
-  salespersonCreate: (name: string, sort: number) =>
-    request('POST', '/api/salespersons', { name, sort }),
+  salespersonCreate: (payload: unknown) => request('POST', '/api/salespersons', payload),
   salespersonUpdate: (payload: unknown) => request('POST', '/api/salespersons/update', payload),
+
+  // 提成规则（仅管理员，v0.20）
+  commissionRuleList: () => request('GET', '/api/commission-rules'),
+  commissionRuleCreate: (payload: unknown) => request('POST', '/api/commission-rules', payload),
+  commissionRuleUpdate: (payload: unknown) => request('POST', '/api/commission-rules/update', payload),
 
   // 用户管理（仅管理员）
   userList: () => request('GET', '/api/users'),
-  userCreate: (username: string, name: string, password: string) =>
-    request('POST', '/api/users', { username, name, password }),
+  userCreate: (username: string, name: string, password: string, distributorId = 0) =>
+    request('POST', '/api/users', { username, name, password, distributorId }),
   userSetStatus: (id: number, status: number) =>
     request('POST', '/api/users/status', { id, status }),
   userResetPassword: (id: number, newPassword: string) =>
