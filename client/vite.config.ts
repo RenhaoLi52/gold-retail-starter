@@ -7,6 +7,8 @@ import vue from '@vitejs/plugin-vue'
 //   这样开发时前端(5173)和后端(8080)虽然是两个端口，代码里只写 /api/... 即可
 export default defineConfig({
   plugins: [vue()],
+  base: './', // 打包后用相对路径引用资源，file:// 下才能加载（Electron 打包模式需要）
+
   server: {
     port: 5173,
     proxy: {

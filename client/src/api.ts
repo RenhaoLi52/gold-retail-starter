@@ -1,14 +1,44 @@
 // 统一的 API 调用封装：自动带 token、统一抛中文错误。
 // 所有接口调用都走这里，别在页面里直接写 fetch。
 
-let token = ''
+// 令牌持久化（v0.13）：JWT 本身有效期12小时，但之前只存在内存变量里，
+// 一刷新页面变量清零就"被登出"了。现在同步存进 localStorage（本地小仓库，
+// 刷新/重开窗口都不丢），启动时先从仓库恢复。
+const TOKEN_KEY = 'gold_token'
+
+function loadSavedToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || ''
+  } catch {
+    return '' // 某些受限环境没有 localStorage，退化为纯内存模式
+  }
+}
+
+let token = loadSavedToken()
 
 export function setToken(t: string) {
   token = t
+  try {
+    if (t) localStorage.setItem(TOKEN_KEY, t)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {}
 }
 
+export function hasToken() {
+  return !!token
+}
+
+export function clearToken() {
+  setToken('')
+}
+
+// API 基础地址：
+// - 浏览器/Electron开发模式：页面由 Vite 提供（http://），走相对路径，由 Vite 代理转给后端。
+// - Electron 打包模式：页面是本地文件（file://），没有代理，必须写全后端地址。
+const API_BASE = location.protocol === 'file:' ? 'http://localhost:8080' : ''
+
 async function request(method: string, path: string, body?: unknown) {
-  const res = await fetch(path, {
+  const res = await fetch(API_BASE + path, {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -18,6 +48,8 @@ async function request(method: string, path: string, body?: unknown) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
+    // 401 = 令牌过期或账号被禁用：把本地保存的令牌清掉，避免下次启动还拿着废令牌
+    if (res.status === 401) clearToken()
     throw new Error(data.error || `请求失败(${res.status})`)
   }
   return data
@@ -26,6 +58,7 @@ async function request(method: string, path: string, body?: unknown) {
 export const api = {
   login: (username: string, password: string) =>
     request('POST', '/api/login', { username, password }),
+  me: () => request('GET', '/api/me'),
   items: (params?: Record<string, string>) => {
     const qs = params ? '?' + new URLSearchParams(params).toString() : ''
     return request('GET', '/api/items' + qs)
@@ -42,6 +75,12 @@ export const api = {
   outboundUnconfirm: (id: number) => request('POST', '/api/doc/outbound/unconfirm', { id }),
   outboundDelete: (id: number) => request('POST', '/api/doc/outbound/delete', { id }),
   outboundList: () => request('GET', '/api/doc/outbound'),
+
+  saleSave: (payload: unknown) => request('POST', '/api/doc/sale/save', payload),
+  saleConfirm: (id: number) => request('POST', '/api/doc/sale/confirm', { id }),
+  saleUnconfirm: (id: number) => request('POST', '/api/doc/sale/unconfirm', { id }),
+  saleDelete: (id: number) => request('POST', '/api/doc/sale/delete', { id }),
+  saleList: () => request('GET', '/api/doc/sale'),
 
   changePassword: (oldPassword: string, newPassword: string) =>
     request('POST', '/api/me/password', { oldPassword, newPassword }),

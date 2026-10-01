@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // 入库单界面 v0.3：支持单据生命周期——保存草稿 → 确认 → 反确认 / 删除草稿
 // 草稿可反复编辑；确认后生成货品件进入库存；反确认撤回（条码保留）。
-import { ref } from 'vue'
-import { api, setToken } from './api'
+import { onMounted, ref } from 'vue'
+import { api, setToken, hasToken, clearToken } from './api'
 
 // ===== 登录 =====
 const logged = ref(false)
@@ -90,6 +90,151 @@ async function loadGpHistory() {
 async function toggleGpHistory() {
   showGpHistory.value = !showGpHistory.value
   if (showGpHistory.value) await loadGpHistory()
+}
+
+// ===== 销售单 =====
+interface SaleLine {
+  barcode: string
+  name: string
+  purity: string
+  weightG: number
+  price: number
+  mode: string
+  soldPrice: number | null
+}
+interface SDoc {
+  id: number
+  docNo: string
+  status: string
+  totalAmount: number
+  lines: SaleLine[]
+  madeAt: string
+}
+const sdocs = ref<SDoc[]>([])
+const slEditingId = ref(0)
+const slEditingNo = ref('')
+const slLines = ref<SaleLine[]>([])
+const slInput = ref('')
+
+function slReset() {
+  slEditingId.value = 0
+  slEditingNo.value = ''
+  slLines.value = []
+  slInput.value = ''
+}
+function goldRateOf(purity: string): number {
+  return goldPrices.value.find(g => g.purity === purity)?.retailPrice ?? 0
+}
+// 建议价：标签价→售价；变金价→克重×当前金价
+function suggestPrice(l: SaleLine): number {
+  if (l.mode === '标签价') return l.price
+  return Math.round(l.weightG * goldRateOf(l.purity) * 100) / 100
+}
+function slModeChanged(l: SaleLine) {
+  l.soldPrice = suggestPrice(l)
+}
+function slAdd() {
+  const bc = slInput.value.trim().toUpperCase()
+  if (!bc) return
+  if (slLines.value.some(x => x.barcode === bc)) {
+    errMsg.value = `条码 ${bc} 已在本单中`
+    return
+  }
+  const it = items.value.find(x => x.barcode === bc)
+  if (!it) {
+    errMsg.value = `条码 ${bc} 不在当前库存列表中`
+    return
+  }
+  if (it.status !== '在库') {
+    errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能销售`
+    return
+  }
+  // 默认结算方式：有标签价用标签价，否则变金价
+  const mode = (it.price ?? 0) > 0 ? '标签价' : '变金价'
+  const line: SaleLine = {
+    barcode: bc, name: it.name, purity: it.purity,
+    weightG: it.weightG, price: it.price ?? 0, mode, soldPrice: null,
+  }
+  line.soldPrice = suggestPrice(line)
+  if (mode === '变金价' && goldRateOf(it.purity) <= 0) {
+    errMsg.value = `成色「${it.purity}」今日未发布金价——请先发布金价或改用标签价`
+  } else {
+    errMsg.value = ''
+  }
+  slLines.value.push(line)
+  slInput.value = ''
+}
+function slRemove(i: number) {
+  slLines.value.splice(i, 1)
+}
+const slTotal = () => slLines.value.reduce((s2, l) => s2 + (Number(l.soldPrice) || 0), 0)
+
+async function slSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.saleSave({
+      id: slEditingId.value,
+      lines: slLines.value.map(l => ({
+        barcode: l.barcode, mode: l.mode, soldPrice: Number(l.soldPrice) || 0,
+      })),
+    })
+    const id = slEditingId.value || r.id
+    if (!slEditingId.value) {
+      slEditingId.value = r.id
+      slEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      const c = await api.saleConfirm(id)
+      flash(`已收款确认：${slEditingNo.value}，合计 ¥${c.totalAmount}`)
+      slReset()
+    } else {
+      flash(`销售草稿已保存：${slEditingNo.value}`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function slConfirmDoc(d: SDoc) {
+  errMsg.value = ''
+  try {
+    const c = await api.saleConfirm(d.id)
+    flash(`已收款确认：${d.docNo}，合计 ¥${c.totalAmount}`)
+    if (slEditingId.value === d.id) slReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function slUnconfirmDoc(d: SDoc) {
+  errMsg.value = ''
+  try {
+    await api.saleUnconfirm(d.id)
+    flash(`销售已反确认：${d.docNo}，货品回到在库`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function slDeleteDoc(d: SDoc) {
+  errMsg.value = ''
+  try {
+    await api.saleDelete(d.id)
+    flash(`销售草稿 ${d.docNo} 已删除`)
+    if (slEditingId.value === d.id) slReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function slEdit(d: SDoc) {
+  slEditingId.value = d.id
+  slEditingNo.value = d.docNo
+  slLines.value = d.lines.map(l => ({ ...l }))
+  window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 // ===== 退库单 =====
@@ -369,19 +514,43 @@ async function doLogin() {
   }
 }
 
+function doLogout() {
+  clearToken()
+  logged.value = false
+  userLabel.value = ''
+  isAdmin.value = false
+  password.value = ''
+}
+
+// 启动时恢复登录态（v0.13）：本地仓库里有令牌就拿去问后端"我是谁"。
+// 令牌过期/账号被禁用会收到401（request里顺手清掉废令牌），安静地留在登录页。
+onMounted(async () => {
+  if (!hasToken()) return
+  try {
+    const r = await api.me()
+    userLabel.value = r.name
+    isAdmin.value = !!r.isAdmin
+    logged.value = true
+    await refreshAll()
+  } catch {
+    // 恢复失败不弹错——用户看到登录页自然会重新登录
+  }
+})
+
 async function refreshAll() {
   const params: Record<string, string> = {}
   if (fStatus.value) params.status = fStatus.value
   if (fCategory.value) params.category = fCategory.value
   if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
-  const [ri, rd, ro] = await Promise.all([
-    api.items(params), api.inboundList(), api.outboundList(),
+  const [ri, rd, ro, rs] = await Promise.all([
+    api.items(params), api.inboundList(), api.outboundList(), api.saleList(),
   ])
   items.value = ri.list
   itemsTotal.value = ri.total
   itemsSumW.value = ri.sumWeightG
   docs.value = rd.list
   odocs.value = ro.list
+  sdocs.value = rs.list
   await loadDicts()
   await loadGoldPrices()
 }
@@ -515,6 +684,7 @@ function editDoc(d: Doc) {
         <button class="mini" @click="showPwd = !showPwd">修改密码</button>
         <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
         <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
+        <button class="mini" @click="doLogout">退出登录</button>
       </p>
       <div v-if="showPwd" class="card">
         <div class="row">
@@ -625,6 +795,81 @@ function editDoc(d: Doc) {
             </tr>
           </tbody>
         </table>
+      </section>
+
+      <!-- 销售开单 -->
+      <section class="card">
+        <h2>
+          {{ slEditingId ? `编辑销售草稿 ${slEditingNo}` : '销售开单' }}
+          <button v-if="slEditingId" class="mini" @click="slReset">放弃编辑，新建</button>
+        </h2>
+        <div class="row">
+          <label>条码 <input v-model="slInput" placeholder="扫码或输入后回车" @keyup.enter="slAdd" class="mono" /></label>
+          <button class="mini" @click="slAdd">添加</button>
+        </div>
+        <table v-if="slLines.length">
+          <thead>
+            <tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>克重</th><th>标签价</th><th>结算方式</th><th>参考价</th><th>实售价(¥)</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(l, i) in slLines" :key="l.barcode">
+              <td>{{ i + 1 }}</td>
+              <td class="mono">{{ l.barcode }}</td>
+              <td>{{ l.name }}</td>
+              <td>{{ l.purity }}</td>
+              <td>{{ l.weightG.toFixed(2) }}g</td>
+              <td>{{ l.price > 0 ? '¥' + l.price.toFixed(0) : '—' }}</td>
+              <td>
+                <select v-model="l.mode" @change="slModeChanged(l)">
+                  <option :disabled="l.price <= 0">标签价</option>
+                  <option>变金价</option>
+                </select>
+              </td>
+              <td class="hint">¥{{ suggestPrice(l).toFixed(2) }}<span v-if="l.mode === '变金价'">（{{ l.weightG.toFixed(2) }}g × {{ goldRateOf(l.purity).toFixed(2) }}）</span></td>
+              <td><input v-model.number="l.soldPrice" type="number" step="0.01" style="width:110px" /></td>
+              <td><button class="mini" @click="slRemove(i)">移除</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row" v-if="slLines.length">
+          <p class="ok" style="margin:0">合计：¥{{ slTotal().toFixed(2) }}</p>
+          <span class="spacer"></span>
+          <button class="gray" @click="slSave(false)">保存草稿(挂单)</button>
+          <button @click="slSave(true)">确认收款</button>
+        </div>
+        <p class="hint">标签价=按货品售价；变金价=克重×该成色今日零售金价。实售价可在参考价上议价修改。</p>
+      </section>
+
+      <!-- 销售单列表 -->
+      <section class="card" v-if="sdocs.length">
+        <h2>销售单列表（{{ sdocs.length }} 张）</h2>
+        <div v-for="d in sdocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span class="ok" v-if="d.totalAmount > 0">¥{{ d.totalAmount.toFixed(2) }}</span>
+            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="slEdit(d)">取单</button>
+              <button class="mini" @click="slConfirmDoc(d)">确认收款</button>
+              <button class="mini danger" @click="slDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini danger" @click="slUnconfirmDoc(d)">反确认(限当日)</button>
+            </template>
+          </div>
+          <table v-if="d.lines?.length">
+            <tbody>
+              <tr v-for="(l, j) in d.lines" :key="j">
+                <td class="mono" style="width:150px">{{ l.barcode }}</td>
+                <td>{{ l.name }}</td>
+                <td style="width:90px">{{ l.mode }}</td>
+                <td style="width:110px">¥{{ Number(l.soldPrice ?? 0).toFixed(2) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- 开单表单 -->
@@ -771,6 +1016,7 @@ function editDoc(d: Doc) {
             <select v-model="fStatus" @change="refreshAll">
               <option value="">全部</option>
               <option>在库</option>
+              <option>已售</option>
               <option>已退库</option>
             </select>
           </label>
