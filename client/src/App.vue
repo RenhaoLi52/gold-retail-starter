@@ -174,7 +174,9 @@ function slAdd() {
     return
   }
   if (it.status !== '在库') {
-    errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能销售`
+    errMsg.value = it.status === '销售中' || it.status === '退库中'
+      ? `条码 ${bc} 当前「${it.status}」（被某张草稿占着）——先处理那张草稿，或换一件`
+      : `条码 ${bc} 当前状态「${it.status}」，不能销售`
     return
   }
   // 默认结算方式：有标签价用标签价，否则变金价
@@ -307,7 +309,9 @@ function obAdd() {
   if (!it) {
     errMsg.value = `条码 ${bc} 不在库存列表中（保存时以服务端校验为准）`
   } else if (it.status !== '在库') {
-    errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能退库`
+    errMsg.value = it.status === '销售中' || it.status === '退库中'
+      ? `条码 ${bc} 当前「${it.status}」（被某张草稿占着）——先处理那张草稿`
+      : `条码 ${bc} 当前状态「${it.status}」，不能退库`
     return
   } else {
     errMsg.value = ''
@@ -1167,6 +1171,8 @@ function editDoc(d: Doc) {
             <select v-model="fStatus" @change="refreshAll">
               <option value="">全部</option>
               <option>在库</option>
+              <option>销售中</option>
+              <option>退库中</option>
               <option>已售</option>
               <option>已退库</option>
             </select>
