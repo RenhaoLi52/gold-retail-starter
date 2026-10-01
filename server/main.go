@@ -629,6 +629,313 @@ func handleDictUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": req.ID})
 }
 
+// ===== 首饰退库单（v0.7）—— 按"新模块checklist"添加的第一个单据 =====
+// 业务：把总库在库的件退回供应商。件状态：在库 →(确认)→ 已退库 →(反确认)→ 在库。
+// 并发裁决复用同一模式：确认时对每件做条件更新 WHERE status='在库'，
+// 若某件已被其他单据占用，整单回滚并指明条码。
+
+// POST /api/doc/outbound/save  {id?, supplier, barcodes[]}
+func handleOutboundSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       int64    `json:"id"`
+		Supplier string   `json:"supplier"`
+		Barcodes []string `json:"barcodes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Barcodes) == 0 {
+		writeErr(w, 400, "参数错误：至少要有一个条码")
+		return
+	}
+	// 规范化+去重+逐个校验（必须存在且在库），同时取快照用于草稿展示
+	seen := map[string]bool{}
+	lines := []DraftLine{}
+	for i, raw := range req.Barcodes {
+		bc := strings.ToUpper(strings.TrimSpace(raw))
+		if !validBarcode(bc) {
+			writeErr(w, 400, fmt.Sprintf("第%d个条码 %s 格式非法", i+1, bc))
+			return
+		}
+		if seen[bc] {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 重复", bc))
+			return
+		}
+		seen[bc] = true
+		var l DraftLine
+		var status string
+		err := db.QueryRow(`SELECT name, purity, weight_g, status FROM item WHERE barcode=$1`, bc).
+			Scan(&l.Name, &l.Purity, &l.WeightG, &status)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", bc))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "查询失败: "+err.Error())
+			return
+		}
+		if status != "在库" {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」，不能退库", bc, status))
+			return
+		}
+		l.Barcode = bc
+		lines = append(lines, l)
+	}
+	linesJSON, _ := json.Marshal(lines)
+
+	if req.ID == 0 {
+		tx, err := db.Begin()
+		if err != nil {
+			writeErr(w, 500, "开启事务失败: "+err.Error())
+			return
+		}
+		defer tx.Rollback()
+		today := time.Now().Format("20060102")
+		seq, err := nextSeq(tx, "TK", today)
+		if err != nil {
+			writeErr(w, 500, "单号发号失败: "+err.Error())
+			return
+		}
+		if seq > 99 {
+			writeErr(w, 400, "当日退库单号已满99张")
+			return
+		}
+		docNo := fmt.Sprintf("TK%s%02d", today, seq)
+		var docID int64
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, supplier, maker_id, draft_lines)
+			VALUES ($1, 'outbound', '草稿', $2, $3, $4) RETURNING id`,
+			docNo, strings.TrimSpace(req.Supplier), currentUID(r), linesJSON).Scan(&docID)
+		if err != nil {
+			writeErr(w, 500, "保存失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
+		return
+	}
+	res, err := db.Exec(`UPDATE doc SET supplier=$1, draft_lines=$2
+		WHERE id=$3 AND doc_type='outbound' AND status='草稿'`,
+		strings.TrimSpace(req.Supplier), linesJSON, req.ID)
+	if err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "该单据不是草稿状态（可能已被确认或删除），请刷新")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/outbound/confirm {id}
+func handleOutboundConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`UPDATE doc SET status='已确认', confirmed_at=now()
+		WHERE id=$1 AND doc_type='outbound' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
+		return
+	}
+	var linesJSON []byte
+	if err := tx.QueryRow(`SELECT draft_lines FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var lines []DraftLine
+	if err := json.Unmarshal(linesJSON, &lines); err != nil || len(lines) == 0 {
+		writeErr(w, 400, "草稿明细为空，无法确认")
+		return
+	}
+	for i, l := range lines {
+		// 核心：条件更新。该件若已被别的业务占用（不再"在库"），这里影响行数=0，整单回滚。
+		var itemID int64
+		err := tx.QueryRow(`UPDATE item SET status='已退库', version=version+1
+			WHERE barcode=$1 AND status='在库' RETURNING id`, l.Barcode).Scan(&itemID)
+		if err == sql.ErrNoRows {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, l.Barcode).Scan(&cur)
+			if cur == "" {
+				cur = "不存在"
+			}
+			writeErr(w, 400, fmt.Sprintf("第%d行条码 %s 当前状态「%s」，整单未确认", i+1, l.Barcode, cur))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "更新货品失败: "+err.Error())
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO doc_line (doc_id, item_id, line_no) VALUES ($1,$2,$3)`,
+			req.ID, itemID, i+1); err != nil {
+			writeErr(w, 500, "写入明细失败: "+err.Error())
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, from_loc, operator_id)
+			VALUES ($1,$2,'在库','已退库','总库',$3)`, itemID, req.ID, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认"})
+}
+
+// POST /api/doc/outbound/unconfirm {id} —— 件从已退库回到在库
+func handleOutboundUnconfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE doc SET status='草稿', confirmed_at=NULL
+		WHERE id=$1 AND doc_type='outbound' AND status='已确认'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "反确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "反确认失败：单据不存在或不是已确认状态，请刷新")
+		return
+	}
+	rows, err := tx.Query(`SELECT it.id, it.barcode FROM doc_line dl
+		JOIN item it ON it.id = dl.item_id WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "明细查询失败: "+err.Error())
+		return
+	}
+	type ref struct {
+		id      int64
+		barcode string
+	}
+	var refs []ref
+	for rows.Next() {
+		var rf ref
+		if err := rows.Scan(&rf.id, &rf.barcode); err != nil {
+			rows.Close()
+			writeErr(w, 500, "明细读取失败: "+err.Error())
+			return
+		}
+		refs = append(refs, rf)
+	}
+	rows.Close()
+	for _, rf := range refs {
+		res, err := tx.Exec(`UPDATE item SET status='在库', version=version+1
+			WHERE id=$1 AND status='已退库'`, rf.id)
+		if err != nil {
+			writeErr(w, 500, "恢复货品失败: "+err.Error())
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeErr(w, 400, fmt.Sprintf("反确认被拒绝：条码 %s 状态异常", rf.barcode))
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, to_loc, operator_id)
+			VALUES ($1,$2,'已退库','在库','总库',$3)`, rf.id, req.ID, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	if _, err = tx.Exec(`DELETE FROM doc_line WHERE doc_id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "删除明细失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/outbound/delete {id}
+func handleOutboundDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	res, err := db.Exec(`DELETE FROM doc WHERE id=$1 AND doc_type='outbound' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "删除失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "删除失败：只有草稿可以删除（已确认的请先反确认）")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": req.ID})
+}
+
+// GET /api/doc/outbound —— 退库单列表
+func handleOutboundList(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT id, doc_no, COALESCE(supplier,''), status, draft_lines,
+		to_char(created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc WHERE doc_type='outbound' ORDER BY id DESC LIMIT 20`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type ODoc struct {
+		ID       int64  `json:"id"`
+		DocNo    string `json:"docNo"`
+		Supplier string `json:"supplier"`
+		Status   string `json:"status"`
+		Items    []Item `json:"items"`
+		MadeAt   string `json:"madeAt"`
+	}
+	docs := []ODoc{}
+	drafts := map[int64][]byte{}
+	for rows.Next() {
+		var d ODoc
+		var dl []byte
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Supplier, &d.Status, &dl, &d.MadeAt); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		d.Items = []Item{}
+		drafts[d.ID] = dl
+		docs = append(docs, d)
+	}
+	for i := range docs {
+		var lines []DraftLine
+		_ = json.Unmarshal(drafts[docs[i].ID], &lines)
+		for _, l := range lines {
+			docs[i].Items = append(docs[i].Items, Item{Barcode: l.Barcode, Name: l.Name,
+				Purity: l.Purity, WeightG: l.WeightG, Status: docs[i].Status})
+		}
+	}
+	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT id, barcode, name, purity, weight_g, status
@@ -1060,6 +1367,11 @@ func main() {
 	mux.HandleFunc("POST /api/doc/inbound/unconfirm", withAuth(handleInboundUnconfirm))
 	mux.HandleFunc("POST /api/doc/inbound/delete", withAuth(handleInboundDelete))
 	mux.HandleFunc("GET /api/doc/inbound", withAuth(handleInboundList))
+	mux.HandleFunc("POST /api/doc/outbound/save", withAuth(handleOutboundSave))
+	mux.HandleFunc("POST /api/doc/outbound/confirm", withAuth(handleOutboundConfirm))
+	mux.HandleFunc("POST /api/doc/outbound/unconfirm", withAuth(handleOutboundUnconfirm))
+	mux.HandleFunc("POST /api/doc/outbound/delete", withAuth(handleOutboundDelete))
+	mux.HandleFunc("GET /api/doc/outbound", withAuth(handleOutboundList))
 
 	fmt.Println("后端已启动: http://localhost:8080/api/health  (Ctrl+C 停止)")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

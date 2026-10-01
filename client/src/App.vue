@@ -42,6 +42,122 @@ interface Line {
   purity: string
   weightG: number | null
 }
+// ===== 退库单 =====
+interface ODoc {
+  id: number
+  docNo: string
+  supplier: string
+  status: string
+  items: Item[]
+  madeAt: string
+}
+const odocs = ref<ODoc[]>([])
+const obEditingId = ref(0)
+const obEditingNo = ref('')
+const obSupplier = ref('')
+const obBarcodes = ref<string[]>([])
+const obInput = ref('')
+
+function obReset() {
+  obEditingId.value = 0
+  obEditingNo.value = ''
+  obSupplier.value = ''
+  obBarcodes.value = []
+  obInput.value = ''
+}
+// 扫码/输入条码后回车或点添加：本地先查库存给出即时反馈，保存时服务端再校验
+function obAdd() {
+  const bc = obInput.value.trim().toUpperCase()
+  if (!bc) return
+  if (obBarcodes.value.includes(bc)) {
+    errMsg.value = `条码 ${bc} 已在本单中`
+    return
+  }
+  const it = items.value.find(x => x.barcode === bc)
+  if (!it) {
+    errMsg.value = `条码 ${bc} 不在库存列表中（保存时以服务端校验为准）`
+  } else if (it.status !== '在库') {
+    errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能退库`
+    return
+  } else {
+    errMsg.value = ''
+  }
+  obBarcodes.value.push(bc)
+  obInput.value = ''
+}
+function obItemOf(bc: string) {
+  return items.value.find(x => x.barcode === bc)
+}
+function obRemove(i: number) {
+  obBarcodes.value.splice(i, 1)
+}
+async function obSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.outboundSave({
+      id: obEditingId.value,
+      supplier: obSupplier.value,
+      barcodes: obBarcodes.value,
+    })
+    const id = obEditingId.value || r.id
+    if (!obEditingId.value) {
+      obEditingId.value = r.id
+      obEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      await api.outboundConfirm(id)
+      flash(`退库已确认：${obEditingNo.value}`)
+      obReset()
+    } else {
+      flash(`退库草稿已保存：${obEditingNo.value}`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function obConfirmDoc(d: ODoc) {
+  errMsg.value = ''
+  try {
+    await api.outboundConfirm(d.id)
+    flash(`退库已确认：${d.docNo}`)
+    if (obEditingId.value === d.id) obReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function obUnconfirmDoc(d: ODoc) {
+  errMsg.value = ''
+  try {
+    await api.outboundUnconfirm(d.id)
+    flash(`退库已反确认：${d.docNo}，货品已回到在库`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function obDeleteDoc(d: ODoc) {
+  errMsg.value = ''
+  try {
+    await api.outboundDelete(d.id)
+    flash(`退库草稿 ${d.docNo} 已删除`)
+    if (obEditingId.value === d.id) obReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function obEdit(d: ODoc) {
+  obEditingId.value = d.id
+  obEditingNo.value = d.docNo
+  obSupplier.value = d.supplier
+  obBarcodes.value = d.items.map(it => it.barcode)
+}
+
 // ===== 基础资料字典 =====
 interface DictItem {
   id: number
@@ -204,9 +320,10 @@ async function doLogin() {
 }
 
 async function refreshAll() {
-  const [ri, rd] = await Promise.all([api.items(), api.inboundList()])
+  const [ri, rd, ro] = await Promise.all([api.items(), api.inboundList(), api.outboundList()])
   items.value = ri.list
   docs.value = rd.list
+  odocs.value = ro.list
   await loadDicts()
 }
 
@@ -473,6 +590,69 @@ function editDoc(d: Doc) {
             <tbody>
               <tr v-for="(it, j) in d.items" :key="j">
                 <td class="mono" style="width:160px">{{ it.barcode || '(待发号)' }}</td>
+                <td>{{ it.name }}</td>
+                <td style="width:110px">{{ it.purity }}</td>
+                <td style="width:90px">{{ (it.weightG ?? 0).toFixed(2) }}g</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 退库单 -->
+      <section class="card">
+        <h2>
+          {{ obEditingId ? `编辑退库草稿 ${obEditingNo}` : '新建退库单' }}
+          <button v-if="obEditingId" class="mini" @click="obReset">放弃编辑，新建</button>
+        </h2>
+        <div class="row">
+          <label>退往供应商 <input v-model="obSupplier" placeholder="选填" /></label>
+          <label>条码 <input v-model="obInput" placeholder="扫码或输入后回车" @keyup.enter="obAdd" class="mono" /></label>
+          <button class="mini" @click="obAdd">添加</button>
+        </div>
+        <table v-if="obBarcodes.length">
+          <thead><tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>重量(g)</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="(bc, i) in obBarcodes" :key="bc">
+              <td>{{ i + 1 }}</td>
+              <td class="mono">{{ bc }}</td>
+              <td>{{ obItemOf(bc)?.name || '?' }}</td>
+              <td>{{ obItemOf(bc)?.purity || '?' }}</td>
+              <td>{{ (obItemOf(bc)?.weightG ?? 0).toFixed(2) }}</td>
+              <td><button class="mini" @click="obRemove(i)">移除</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row" v-if="obBarcodes.length">
+          <button class="gray" @click="obSave(false)">保存草稿</button>
+          <button @click="obSave(true)">保存并确认退库</button>
+        </div>
+        <p class="hint">确认后货品状态变为"已退库"；退过库的货品会阻止其入库单反确认（下游校验）。</p>
+      </section>
+
+      <!-- 退库单列表 -->
+      <section class="card" v-if="odocs.length">
+        <h2>退库单列表（{{ odocs.length }} 张）</h2>
+        <div v-for="d in odocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span>{{ d.supplier || '—' }}</span>
+            <span class="hint">{{ (d.items?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="obEdit(d)">编辑</button>
+              <button class="mini" @click="obConfirmDoc(d)">确认</button>
+              <button class="mini danger" @click="obDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini danger" @click="obUnconfirmDoc(d)">反确认</button>
+            </template>
+          </div>
+          <table v-if="d.items?.length">
+            <tbody>
+              <tr v-for="(it, j) in d.items" :key="j">
+                <td class="mono" style="width:160px">{{ it.barcode }}</td>
                 <td>{{ it.name }}</td>
                 <td style="width:110px">{{ it.purity }}</td>
                 <td style="width:90px">{{ (it.weightG ?? 0).toFixed(2) }}g</td>
