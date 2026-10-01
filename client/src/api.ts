@@ -34,4 +34,6 @@ export const api = {
   inboundUnconfirm: (id: number) => request('POST', '/api/doc/inbound/unconfirm', { id }),
   inboundDelete: (id: number) => request('POST', '/api/doc/inbound/delete', { id }),
   inboundList: () => request('GET', '/api/doc/inbound'),
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request('POST', '/api/me/password', { oldPassword, newPassword }),
 }

@@ -41,6 +41,23 @@ interface Line {
   purity: string
   weightG: number | null
 }
+// ===== 修改密码 =====
+const showPwd = ref(false)
+const oldPwd = ref('')
+const newPwd = ref('')
+async function changePwd() {
+  errMsg.value = ''
+  try {
+    await api.changePassword(oldPwd.value, newPwd.value)
+    flash('密码已修改，下次登录请用新密码')
+    showPwd.value = false
+    oldPwd.value = ''
+    newPwd.value = ''
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 const editingId = ref(0) // 0=新单；>0=正在编辑的草稿id
 const editingNo = ref('')
 const category = ref('黄金')
@@ -200,7 +217,17 @@ function editDoc(d: Doc) {
     </section>
 
     <template v-else>
-      <p class="hint">当前用户：{{ userLabel }}</p>
+      <p class="hint">
+        当前用户：{{ userLabel }}
+        <button class="mini" @click="showPwd = !showPwd">修改密码</button>
+      </p>
+      <div v-if="showPwd" class="card">
+        <div class="row">
+          <label>旧密码 <input v-model="oldPwd" type="password" /></label>
+          <label>新密码(至少6位) <input v-model="newPwd" type="password" /></label>
+          <button @click="changePwd">确认修改</button>
+        </div>
+      </div>
       <p v-if="okMsg" class="ok">{{ okMsg }}</p>
       <p v-if="errMsg" class="err">{{ errMsg }}</p>
 
@@ -248,7 +275,7 @@ function editDoc(d: Doc) {
             <span class="mono">{{ d.docNo }}</span>
             <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
             <span>{{ d.category }}</span>
-            <span class="hint">{{ d.items.length }} 件 · {{ d.madeAt }}</span>
+            <span class="hint">{{ (d.items?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
             <span class="spacer"></span>
             <template v-if="d.status === '草稿'">
               <button class="mini" @click="editDoc(d)">编辑</button>
@@ -259,13 +286,13 @@ function editDoc(d: Doc) {
               <button class="mini danger" @click="unconfirmDoc(d)">反确认</button>
             </template>
           </div>
-          <table v-if="d.items.length">
+          <table v-if="d.items?.length">
             <tbody>
               <tr v-for="(it, j) in d.items" :key="j">
                 <td class="mono" style="width:160px">{{ it.barcode || '(待发号)' }}</td>
                 <td>{{ it.name }}</td>
                 <td style="width:110px">{{ it.purity }}</td>
-                <td style="width:90px">{{ it.weightG.toFixed(2) }}g</td>
+                <td style="width:90px">{{ (it.weightG ?? 0).toFixed(2) }}g</td>
               </tr>
             </tbody>
           </table>
@@ -284,7 +311,7 @@ function editDoc(d: Doc) {
               <td class="mono">{{ it.barcode }}</td>
               <td>{{ it.name }}</td>
               <td>{{ it.purity }}</td>
-              <td>{{ it.weightG.toFixed(2) }}</td>
+              <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
               <td>{{ it.status }}</td>
             </tr>
           </tbody>

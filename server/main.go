@@ -17,14 +17,22 @@
 package main
 
 import (
+	"context"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
 )
 
@@ -57,6 +65,100 @@ type InboundDoc struct {
 }
 
 var db *sql.DB
+
+// ===== 账号与令牌（v0.4） =====
+//
+// 密码存储：PBKDF2-HMAC-SHA256 加盐哈希（Go 标准库），格式 pbkdf2:迭代次数:盐:哈希。
+// 数据库里永远只有哈希——即使整库泄露，也无法还原出密码原文。
+// 登录令牌：JWT(HS256)。服务端签发带过期时间的令牌，之后每个请求凭令牌证明身份，
+// 服务端无需保存会话状态（无状态认证，天然适配多终端）。
+
+var jwtSecret = func() []byte {
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		return []byte(s)
+	}
+	return []byte("dev-secret-change-me-in-production") // 上线前必须用环境变量换掉
+}()
+
+const pbkdf2Iter = 120000
+
+func hashPassword(pw string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	key, err := pbkdf2.Key(sha256.New, pw, salt, pbkdf2Iter, 32)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("pbkdf2:%d:%s:%s", pbkdf2Iter, hex.EncodeToString(salt), hex.EncodeToString(key)), nil
+}
+
+func verifyPassword(pw, stored string) bool {
+	parts := strings.Split(stored, ":")
+	if len(parts) != 4 || parts[0] != "pbkdf2" {
+		return false
+	}
+	iter, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	salt, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	want, err := hex.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, pw, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1 // 恒定时间比较，防时序侧信道
+}
+
+// ensureAdmin 首次启动时创建默认管理员（admin/123456），并提醒改密码
+func ensureAdmin() {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_user`).Scan(&n); err != nil {
+		panic("检查用户表失败: " + err.Error())
+	}
+	if n > 0 {
+		return
+	}
+	h, err := hashPassword("123456")
+	if err != nil {
+		panic("生成密码哈希失败: " + err.Error())
+	}
+	if _, err := db.Exec(`INSERT INTO app_user (username, password, name, status) VALUES ('admin', $1, '超级管理员', 1)`, h); err != nil {
+		panic("创建默认管理员失败: " + err.Error())
+	}
+	fmt.Println("已创建默认管理员 admin / 123456 —— 请尽快登录后修改密码！")
+}
+
+func issueToken(uid int64, username, name string) (string, error) {
+	claims := jwt.MapClaims{
+		"uid":  uid,
+		"usr":  username,
+		"name": name,
+		"exp":  time.Now().Add(12 * time.Hour).Unix(), // 12小时过期，过期需重新登录
+		"iat":  time.Now().Unix(),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(jwtSecret)
+}
+
+type ctxKey string
+
+const ctxUID ctxKey = "uid"
+
+// currentUID 从请求上下文取当前登录用户id（withAuth 已验证并放入）
+func currentUID(r *http.Request) int64 {
+	if v, ok := r.Context().Value(ctxUID).(int64); ok {
+		return v
+	}
+	return 0
+}
 
 // ===== 发号器（事务内取号，并发安全） =====
 
@@ -140,12 +242,29 @@ func withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 func withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return withCORS(func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token != "demo-token-123" {
-			writeErr(w, 401, "未登录或登录已过期")
+		raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if raw == "" {
+			writeErr(w, 401, "未登录")
 			return
 		}
-		next(w, r)
+		tok, err := jwt.Parse(raw, func(t *jwt.Token) (any, error) {
+			if t.Method != jwt.SigningMethodHS256 { // 只接受我们签发时用的算法
+				return nil, fmt.Errorf("算法不符")
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !tok.Valid {
+			writeErr(w, 401, "登录已过期，请重新登录")
+			return
+		}
+		claims, _ := tok.Claims.(jwt.MapClaims)
+		uid, _ := claims["uid"].(float64) // JSON 数字解析为 float64
+		if uid <= 0 {
+			writeErr(w, 401, "令牌无效")
+			return
+		}
+		// 把用户id放进请求上下文，后续处理函数用 currentUID(r) 取
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxUID, int64(uid))))
 	})
 }
 
@@ -168,11 +287,61 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "参数格式错误")
 		return
 	}
-	if req.Username == "admin" && req.Password == "123456" {
-		writeJSON(w, 200, map[string]string{"token": "demo-token-123", "name": "超级管理员"})
+	var uid int64
+	var stored, name string
+	err := db.QueryRow(`SELECT id, password, name FROM app_user WHERE username=$1 AND status=1`,
+		strings.TrimSpace(req.Username)).Scan(&uid, &stored, &name)
+	if err == sql.ErrNoRows || (err == nil && !verifyPassword(req.Password, stored)) {
+		// 账号不存在与密码错误返回同一句话——不给攻击者"账号是否存在"的线索
+		writeErr(w, 401, "账号或密码错误")
 		return
 	}
-	writeErr(w, 401, "账号或密码错误")
+	if err != nil {
+		writeErr(w, 500, "登录失败: "+err.Error())
+		return
+	}
+	token, err := issueToken(uid, req.Username, name)
+	if err != nil {
+		writeErr(w, 500, "签发令牌失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"token": token, "name": name})
+}
+
+// POST /api/me/password —— 修改自己的密码（需先验证旧密码）
+func handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		OldPassword string `json:"oldPassword"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		writeErr(w, 400, "新密码至少6位")
+		return
+	}
+	uid := currentUID(r)
+	var stored string
+	if err := db.QueryRow(`SELECT password FROM app_user WHERE id=$1`, uid).Scan(&stored); err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if !verifyPassword(req.OldPassword, stored) {
+		writeErr(w, 400, "旧密码不正确")
+		return
+	}
+	h, err := hashPassword(req.NewPassword)
+	if err != nil {
+		writeErr(w, 500, "生成哈希失败: "+err.Error())
+		return
+	}
+	if _, err := db.Exec(`UPDATE app_user SET password=$1 WHERE id=$2`, h, uid); err != nil {
+		writeErr(w, 500, "更新失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"ok": "密码已修改"})
 }
 
 func handleItems(w http.ResponseWriter, r *http.Request) {
@@ -241,8 +410,8 @@ func handleInboundSave(w http.ResponseWriter, r *http.Request) {
 		var docID int64
 		err = tx.QueryRow(`
 			INSERT INTO doc (doc_no, doc_type, status, category, maker_id, draft_lines)
-			VALUES ($1, 'inbound', '草稿', $2, 1, $3) RETURNING id`,
-			docNo, req.Category, linesJSON).Scan(&docID)
+			VALUES ($1, 'inbound', '草稿', $2, $3, $4) RETURNING id`,
+			docNo, req.Category, currentUID(r), linesJSON).Scan(&docID)
 		if err != nil {
 			writeErr(w, 500, "保存失败: "+err.Error())
 			return
@@ -357,7 +526,7 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, err = tx.Exec(`
 			INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, to_loc, operator_id)
-			VALUES ($1,$2,'(入库确认)','在库','总库',1)`, itemID, req.ID); err != nil {
+			VALUES ($1,$2,'(入库确认)','在库','总库',$3)`, itemID, req.ID, currentUID(r)); err != nil {
 			writeErr(w, 500, "写入流水失败: "+err.Error())
 			return
 		}
@@ -414,7 +583,7 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	// 下游依赖校验：本单所有件必须仍"在库"且在总库。
 	// （将来有了销售/分销单，被引用的件状态会变，这里就会拦住并指明哪件被占用。）
 	rows, err := tx.Query(`
-		SELECT it.id, it.barcode, it.status
+		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
 	if err != nil {
@@ -426,10 +595,12 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 		barcode string
 	}
 	var itemRefs []ref
+	var rebuilt []DraftLine // 从真实货品件重建草稿明细（兼容老单据草稿字段为空的情况）
 	for rows.Next() {
 		var id int64
-		var bc, st string
-		if err := rows.Scan(&id, &bc, &st); err != nil {
+		var bc, st, name, purity string
+		var wg float64
+		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg); err != nil {
 			rows.Close()
 			writeErr(w, 500, "明细读取失败: "+err.Error())
 			return
@@ -440,14 +611,23 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		itemRefs = append(itemRefs, ref{id, bc})
+		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg})
 	}
 	rows.Close()
+	if len(rebuilt) > 0 {
+		// 把明细(含条码)写回草稿字段——保证反确认后的草稿永远有内容可编辑/再确认
+		rj, _ := json.Marshal(rebuilt)
+		if _, err = tx.Exec(`UPDATE doc SET draft_lines=$1 WHERE id=$2`, rj, req.ID); err != nil {
+			writeErr(w, 500, "回写草稿明细失败: "+err.Error())
+			return
+		}
+	}
 
 	// 写反向流水 → 删明细 → 删件（流水是日志，保留下来就是审计轨迹）
 	for _, it := range itemRefs {
 		if _, err = tx.Exec(`
 			INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, from_loc, operator_id)
-			VALUES ($1,$2,'在库','(反确认撤销)','总库',1)`, it.id, req.ID); err != nil {
+			VALUES ($1,$2,'在库','(反确认撤销)','总库',$3)`, it.id, req.ID, currentUID(r)); err != nil {
 			writeErr(w, 500, "写入流水失败: "+err.Error())
 			return
 		}
@@ -516,6 +696,7 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 		docs = append(docs, d)
 	}
 	for i := range docs {
+		docs[i].Items = []Item{} // 永远返回数组而不是 null，前端渲染才安全
 		if docs[i].Status == "草稿" {
 			var lines []DraftLine
 			_ = json.Unmarshal(drafts[docs[i].ID], &lines)
@@ -564,11 +745,13 @@ func main() {
 	}
 	db.SetMaxOpenConns(10)
 	fmt.Println("数据库已连接:", dsn)
+	ensureAdmin()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", withCORS(handleHealth))
 	mux.HandleFunc("POST /api/login", withCORS(handleLogin))
 	mux.HandleFunc("OPTIONS /api/", withCORS(func(w http.ResponseWriter, r *http.Request) {}))
+	mux.HandleFunc("POST /api/me/password", withAuth(handleChangePassword))
 	mux.HandleFunc("GET /api/items", withAuth(handleItems))
 	mux.HandleFunc("POST /api/doc/inbound/save", withAuth(handleInboundSave))
 	mux.HandleFunc("POST /api/doc/inbound/confirm", withAuth(handleInboundConfirm))
