@@ -47,6 +47,7 @@ type Item struct {
 	WeightG  float64 `json:"weightG"`
 	Price    float64 `json:"price"`
 	Status   string  `json:"status"`
+	Location string  `json:"location,omitempty"` // v0.18：总库 或 分销商名
 }
 
 // DraftLine 草稿明细行（存进 doc.draft_lines 的 JSON 结构，字段名与前端一致）
@@ -831,8 +832,9 @@ func handleOutboundSave(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "查询失败: "+err.Error())
 			return
 		}
+		// v0.18：退供应商只能退总库的货（分销商处的先调拨回总库）
 		res, err := tx.Exec(`UPDATE item SET status='退库中', version=version+1
-			WHERE barcode=$1 AND status='在库'`, l.Barcode)
+			WHERE barcode=$1 AND status='在库' AND location_type='总库'`, l.Barcode)
 		if err != nil {
 			writeErr(w, 500, "锁定货品失败: "+err.Error())
 			return
@@ -840,7 +842,11 @@ func handleOutboundSave(w http.ResponseWriter, r *http.Request) {
 		if n, _ := res.RowsAffected(); n == 0 {
 			var cur string
 			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, l.Barcode).Scan(&cur)
-			writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」（可能已被其他单据占用），整单未保存", l.Barcode, cur))
+			if cur == "在库" {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 在「%s」处——退供应商只能退总库的货，请先调拨回总库", l.Barcode, itemLocName(tx, l.Barcode)))
+			} else {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」（可能已被其他单据占用），整单未保存", l.Barcode, cur))
+			}
 			return
 		}
 	}
@@ -1410,8 +1416,9 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// v0.18：销售开单只能卖总库的货（门店销售待"账号绑门店"后放开）
 		res, err := tx.Exec(`UPDATE item SET status='销售中', version=version+1
-			WHERE barcode=$1 AND status='在库'`, sl.Barcode)
+			WHERE barcode=$1 AND status='在库' AND location_type='总库'`, sl.Barcode)
 		if err != nil {
 			writeErr(w, 500, "锁定货品失败: "+err.Error())
 			return
@@ -1419,7 +1426,11 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		if n, _ := res.RowsAffected(); n == 0 {
 			var cur string
 			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, sl.Barcode).Scan(&cur)
-			writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」（可能已被其他柜台挂单或售出），整单未保存", sl.Barcode, cur))
+			if cur == "在库" {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 在「%s」处——销售开单目前只能卖总库的货，请先调拨回总库", sl.Barcode, itemLocName(tx, sl.Barcode)))
+			} else {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」（可能已被其他柜台挂单或售出），整单未保存", sl.Barcode, cur))
+			}
 			return
 		}
 	}
@@ -2310,6 +2321,583 @@ func handleSaleReturnList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
 }
 
+// ===== 分销商与调拨单（v0.18） =====
+// 位置 = location_type('总库'/'分销商') + distributor_id，与状态(在库/已售)正交。
+// 一种单据三种用法：调拨单(from→to) = 分货 / 退回总库 / 分销商互调。
+// 调拨草稿占用状态 = '调拨中'；确认后位置变更、状态回'在库'。
+
+// locName 位置显示名：0=总库，否则查分销商名
+func locName(q rowQuerier, distID int64) string {
+	if distID == 0 {
+		return "总库"
+	}
+	var n string
+	if err := q.QueryRow(`SELECT name FROM distributor WHERE id=$1`, distID).Scan(&n); err != nil {
+		return "未知分销商"
+	}
+	return n
+}
+
+// itemLocName 某件货当前位置的显示名
+func itemLocName(q rowQuerier, barcode string) string {
+	var lt string
+	var did sql.NullInt64
+	if err := q.QueryRow(`SELECT location_type, distributor_id FROM item WHERE barcode=$1`, barcode).
+		Scan(&lt, &did); err != nil {
+		return "未知"
+	}
+	if lt == "总库" {
+		return "总库"
+	}
+	return locName(q, did.Int64)
+}
+
+// GET /api/distributors —— 所有登录用户可读（调拨下拉要用）
+func handleDistributorList(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT id, name, status FROM distributor ORDER BY id`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type D struct {
+		ID     int64  `json:"id"`
+		Name   string `json:"name"`
+		Status int    `json:"status"`
+	}
+	list := []D{}
+	for rows.Next() {
+		var d D
+		if err := rows.Scan(&d.ID, &d.Name, &d.Status); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// POST /api/distributors —— 新增（管理员）
+func handleDistributorCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len([]rune(req.Name)) > 30 {
+		writeErr(w, 400, "名称不能为空且不超过30字")
+		return
+	}
+	var exists bool
+	_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM distributor WHERE name=$1)`, req.Name).Scan(&exists)
+	if exists {
+		writeErr(w, 400, "该名称已存在")
+		return
+	}
+	var id int64
+	if err := db.QueryRow(`INSERT INTO distributor (name) VALUES ($1) RETURNING id`, req.Name).Scan(&id); err != nil {
+		writeErr(w, 500, "创建失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+// POST /api/distributors/update —— 改名/停用启用（管理员；按id引用，改名安全）
+func handleDistributorUpdate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID     int64   `json:"id"`
+		Name   *string `json:"name"`
+		Status *int    `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if req.Name != nil {
+		n := strings.TrimSpace(*req.Name)
+		if n == "" || len([]rune(n)) > 30 {
+			writeErr(w, 400, "名称不能为空且不超过30字")
+			return
+		}
+		var exists bool
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM distributor WHERE name=$1 AND id<>$2)`, n, req.ID).Scan(&exists)
+		if exists {
+			writeErr(w, 400, "该名称已存在")
+			return
+		}
+		if _, err := db.Exec(`UPDATE distributor SET name=$1 WHERE id=$2`, n, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	if req.Status != nil {
+		if _, err := db.Exec(`UPDATE distributor SET status=$1 WHERE id=$2`, *req.Status, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID})
+}
+
+// checkLoc 校验调拨端点：0=总库恒合法；>0 须是启用的分销商
+func checkLoc(q rowQuerier, distID int64, side string) error {
+	if distID == 0 {
+		return nil
+	}
+	var status int
+	err := q.QueryRow(`SELECT status FROM distributor WHERE id=$1`, distID).Scan(&status)
+	if err != nil {
+		return fmt.Errorf("%s分销商不存在", side)
+	}
+	if status != 1 {
+		return fmt.Errorf("%s分销商已停用", side)
+	}
+	return nil
+}
+
+// POST /api/doc/transfer/save  {id?, fromDistributorId, toDistributorId, barcodes[]}
+func handleTransferSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID                int64    `json:"id"`
+		FromDistributorID int64    `json:"fromDistributorId"` // 0=总库
+		ToDistributorID   int64    `json:"toDistributorId"`   // 0=总库
+		Barcodes          []string `json:"barcodes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Barcodes) == 0 {
+		writeErr(w, 400, "参数错误：至少要有一个条码")
+		return
+	}
+	if req.FromDistributorID == req.ToDistributorID {
+		writeErr(w, 400, "调出方与调入方不能相同")
+		return
+	}
+	seen := map[string]bool{}
+	lines := []DraftLine{}
+	for i, raw := range req.Barcodes {
+		bc := strings.ToUpper(strings.TrimSpace(raw))
+		if !validBarcode(bc) {
+			writeErr(w, 400, fmt.Sprintf("第%d个条码 %s 格式非法", i+1, bc))
+			return
+		}
+		if seen[bc] {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 重复", bc))
+			return
+		}
+		seen[bc] = true
+		lines = append(lines, DraftLine{Barcode: bc})
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if err := checkLoc(tx, req.FromDistributorID, "调出方"); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := checkLoc(tx, req.ToDistributorID, "调入方"); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+
+	if req.ID != 0 {
+		var old []byte
+		err := tx.QueryRow(`SELECT draft_lines FROM doc
+			WHERE id=$1 AND doc_type='transfer' AND status='草稿' FOR UPDATE`, req.ID).Scan(&old)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, "该单据不是草稿状态（可能已被确认或删除），请刷新")
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "读取单据失败: "+err.Error())
+			return
+		}
+		var oldLines []DraftLine
+		_ = json.Unmarshal(old, &oldLines)
+		for _, ol := range oldLines {
+			if _, err := tx.Exec(`UPDATE item SET status='在库', version=version+1
+				WHERE barcode=$1 AND status='调拨中'`, ol.Barcode); err != nil {
+				writeErr(w, 500, "解锁货品失败: "+err.Error())
+				return
+			}
+		}
+	}
+
+	fromName := locName(tx, req.FromDistributorID)
+	for i := range lines {
+		l := &lines[i]
+		err := tx.QueryRow(`SELECT name, purity, weight_g, price FROM item WHERE barcode=$1`, l.Barcode).
+			Scan(&l.Name, &l.Purity, &l.WeightG, &l.Price)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", l.Barcode))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "查询失败: "+err.Error())
+			return
+		}
+		// 锁定：必须 在库 且在调出方位置
+		var res sql.Result
+		if req.FromDistributorID == 0 {
+			res, err = tx.Exec(`UPDATE item SET status='调拨中', version=version+1
+				WHERE barcode=$1 AND status='在库' AND location_type='总库'`, l.Barcode)
+		} else {
+			res, err = tx.Exec(`UPDATE item SET status='调拨中', version=version+1
+				WHERE barcode=$1 AND status='在库' AND location_type='分销商' AND distributor_id=$2`,
+				l.Barcode, req.FromDistributorID)
+		}
+		if err != nil {
+			writeErr(w, 500, "锁定货品失败: "+err.Error())
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, l.Barcode).Scan(&cur)
+			if cur == "在库" {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 在「%s」处，不在调出方「%s」，整单未保存",
+					l.Barcode, itemLocName(tx, l.Barcode), fromName))
+			} else {
+				writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」，不能调拨，整单未保存", l.Barcode, cur))
+			}
+			return
+		}
+	}
+	linesJSON, _ := json.Marshal(lines)
+	var fromID, toID any
+	if req.FromDistributorID > 0 {
+		fromID = req.FromDistributorID
+	}
+	if req.ToDistributorID > 0 {
+		toID = req.ToDistributorID
+	}
+
+	if req.ID == 0 {
+		today := time.Now().Format("20060102")
+		seq, err := nextSeq(tx, "DB", today)
+		if err != nil {
+			writeErr(w, 500, "单号发号失败: "+err.Error())
+			return
+		}
+		if seq > 99 {
+			writeErr(w, 400, "当日调拨单号已满99张")
+			return
+		}
+		docNo := fmt.Sprintf("DB%s%02d", today, seq)
+		var docID int64
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines,
+			from_distributor_id, to_distributor_id)
+			VALUES ($1,'transfer','草稿',$2,$3,$4,$5) RETURNING id`,
+			docNo, currentUID(r), linesJSON, fromID, toID).Scan(&docID)
+		if err != nil {
+			writeErr(w, 500, "保存失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
+		return
+	}
+	if _, err := tx.Exec(`UPDATE doc SET draft_lines=$1, from_distributor_id=$2, to_distributor_id=$3
+		WHERE id=$4`, linesJSON, fromID, toID, req.ID); err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/transfer/confirm {id} —— 位置变更生效：调拨中→在库@调入方
+func handleTransferConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE doc SET status='已确认', confirmed_at=now()
+		WHERE id=$1 AND doc_type='transfer' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
+		return
+	}
+	var linesJSON []byte
+	var fromID, toID sql.NullInt64
+	if err := tx.QueryRow(`SELECT draft_lines, from_distributor_id, to_distributor_id
+		FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON, &fromID, &toID); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var lines []DraftLine
+	if err := json.Unmarshal(linesJSON, &lines); err != nil || len(lines) == 0 {
+		writeErr(w, 400, "草稿明细为空，无法确认")
+		return
+	}
+	if err := checkLoc(tx, toID.Int64, "调入方"); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	fromName, toName := locName(tx, fromID.Int64), locName(tx, toID.Int64)
+	for i, l := range lines {
+		var itemID int64
+		var e error
+		if toID.Int64 == 0 {
+			e = tx.QueryRow(`UPDATE item SET status='在库', location_type='总库', distributor_id=NULL,
+				version=version+1 WHERE barcode=$1 AND status='调拨中' RETURNING id`, l.Barcode).Scan(&itemID)
+		} else {
+			e = tx.QueryRow(`UPDATE item SET status='在库', location_type='分销商', distributor_id=$2,
+				version=version+1 WHERE barcode=$1 AND status='调拨中' RETURNING id`, l.Barcode, toID.Int64).Scan(&itemID)
+		}
+		if e == sql.ErrNoRows {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, l.Barcode).Scan(&cur)
+			writeErr(w, 400, fmt.Sprintf("第%d行条码 %s 当前状态「%s」，整单未确认", i+1, l.Barcode, cur))
+			return
+		}
+		if e != nil {
+			writeErr(w, 500, "更新货品失败: "+e.Error())
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO doc_line (doc_id, item_id, line_no) VALUES ($1,$2,$3)`,
+			req.ID, itemID, i+1); err != nil {
+			writeErr(w, 500, "写入明细失败: "+err.Error())
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, from_loc, to_loc, operator_id)
+			VALUES ($1,$2,'调拨中','在库',$3,$4,$5)`, itemID, req.ID, fromName, toName, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认"})
+}
+
+// POST /api/doc/transfer/unconfirm {id} —— 件从调入方拉回：在库@调入方→调拨中@调出方
+func handleTransferUnconfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE doc SET status='草稿', confirmed_at=NULL
+		WHERE id=$1 AND doc_type='transfer' AND status='已确认'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "反确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "反确认失败：单据不存在或不是已确认状态，请刷新")
+		return
+	}
+	var fromID, toID sql.NullInt64
+	if err := tx.QueryRow(`SELECT from_distributor_id, to_distributor_id FROM doc WHERE id=$1`,
+		req.ID).Scan(&fromID, &toID); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	fromName, toName := locName(tx, fromID.Int64), locName(tx, toID.Int64)
+	rows, err := tx.Query(`SELECT it.id, it.barcode FROM doc_line dl
+		JOIN item it ON it.id = dl.item_id WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "明细查询失败: "+err.Error())
+		return
+	}
+	type ref struct {
+		id      int64
+		barcode string
+	}
+	var refs []ref
+	for rows.Next() {
+		var rf ref
+		if err := rows.Scan(&rf.id, &rf.barcode); err != nil {
+			rows.Close()
+			writeErr(w, 500, "明细读取失败: "+err.Error())
+			return
+		}
+		refs = append(refs, rf)
+	}
+	rows.Close()
+	for _, rf := range refs {
+		// 件必须还"在库"且仍在调入方，才能拉回——已被再次调走/挂单/售出则拒绝
+		var res sql.Result
+		var e error
+		if toID.Int64 == 0 {
+			res, e = tx.Exec(`UPDATE item SET status='调拨中', location_type=$2, distributor_id=$3,
+				version=version+1 WHERE id=$1 AND status='在库' AND location_type='总库'`,
+				rf.id, locTypeOf(fromID.Int64), nullableID(fromID.Int64))
+		} else {
+			res, e = tx.Exec(`UPDATE item SET status='调拨中', location_type=$2, distributor_id=$3,
+				version=version+1 WHERE id=$1 AND status='在库' AND location_type='分销商' AND distributor_id=$4`,
+				rf.id, locTypeOf(fromID.Int64), nullableID(fromID.Int64), toID.Int64)
+		}
+		if e != nil {
+			writeErr(w, 500, "恢复货品失败: "+e.Error())
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE id=$1`, rf.id).Scan(&cur)
+			writeErr(w, 400, fmt.Sprintf("反确认被拒绝：条码 %s 当前状态「%s」或已不在「%s」（可能已被再次占用）",
+				rf.barcode, cur, toName))
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, from_loc, to_loc, operator_id)
+			VALUES ($1,$2,'在库','调拨中',$3,$4,$5)`, rf.id, req.ID, toName, fromName, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	if _, err = tx.Exec(`DELETE FROM doc_line WHERE doc_id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "删除明细失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+func locTypeOf(distID int64) string {
+	if distID == 0 {
+		return "总库"
+	}
+	return "分销商"
+}
+
+func nullableID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
+}
+
+// POST /api/doc/transfer/delete {id} —— 删草稿解锁（件留在调出方）
+func handleTransferDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var old []byte
+	err = tx.QueryRow(`SELECT draft_lines FROM doc
+		WHERE id=$1 AND doc_type='transfer' AND status='草稿' FOR UPDATE`, req.ID).Scan(&old)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, "删除失败：只有草稿可以删除（已确认的请先反确认）")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var oldLines []DraftLine
+	_ = json.Unmarshal(old, &oldLines)
+	for _, ol := range oldLines {
+		if _, err := tx.Exec(`UPDATE item SET status='在库', version=version+1
+			WHERE barcode=$1 AND status='调拨中'`, ol.Barcode); err != nil {
+			writeErr(w, 500, "解锁货品失败: "+err.Error())
+			return
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM doc WHERE id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "删除失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": req.ID})
+}
+
+// GET /api/doc/transfer —— 调拨单列表（带两端名称）
+func handleTransferList(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT d.id, d.doc_no, d.status, d.draft_lines,
+		d.from_distributor_id, COALESCE(f.name,'总库'), d.to_distributor_id, COALESCE(t.name,'总库'),
+		to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc d
+		LEFT JOIN distributor f ON f.id = d.from_distributor_id
+		LEFT JOIN distributor t ON t.id = d.to_distributor_id
+		WHERE d.doc_type='transfer' ORDER BY d.id DESC LIMIT 20`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type TDoc struct {
+		ID       int64       `json:"id"`
+		DocNo    string      `json:"docNo"`
+		Status   string      `json:"status"`
+		FromID   int64       `json:"fromDistributorId"`
+		FromName string      `json:"fromName"`
+		ToID     int64       `json:"toDistributorId"`
+		ToName   string      `json:"toName"`
+		Lines    []DraftLine `json:"lines"`
+		MadeAt   string      `json:"madeAt"`
+	}
+	docs := []TDoc{}
+	for rows.Next() {
+		var d TDoc
+		var dl []byte
+		var fid, tid sql.NullInt64
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &fid, &d.FromName, &tid, &d.ToName, &d.MadeAt); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		d.FromID, d.ToID = fid.Int64, tid.Int64
+		d.Lines = []DraftLine{}
+		_ = json.Unmarshal(dl, &d.Lines)
+		docs = append(docs, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	// 查询参数：status(状态) category(大类) q(条码前缀或名称模糊) —— 都可选
 	q := r.URL.Query()
@@ -2320,28 +2908,38 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		where = append(where, fmt.Sprintf(cond, len(args)))
 	}
 	if v := strings.TrimSpace(q.Get("status")); v != "" {
-		add("status=$%d", v)
+		add("it.status=$%d", v)
 	}
 	if v := strings.TrimSpace(q.Get("category")); v != "" {
-		add("category=$%d", v)
+		add("it.category=$%d", v)
+	}
+	// 位置筛选（v0.18）：loc 参数 "0"=总库，其他数字=分销商id，空=全部
+	if v := strings.TrimSpace(q.Get("loc")); v != "" {
+		if v == "0" {
+			where = append(where, "it.location_type='总库'")
+		} else {
+			add("it.distributor_id=$%d", v)
+		}
 	}
 	if v := strings.TrimSpace(q.Get("q")); v != "" {
 		kw := strings.ToUpper(v)
 		args = append(args, kw+"%", "%"+v+"%")
-		where = append(where, fmt.Sprintf("(barcode LIKE $%d OR name ILIKE $%d)", len(args)-1, len(args)))
+		where = append(where, fmt.Sprintf("(it.barcode LIKE $%d OR it.name ILIKE $%d)", len(args)-1, len(args)))
 	}
 	cond := strings.Join(where, " AND ")
 
 	// 汇总与明细用同一组条件——保证"合计"永远和看到的列表一致
 	var total int
 	var sumW float64
-	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(weight_g),0) FROM item WHERE `+cond, args...).
+	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(it.weight_g),0) FROM item it WHERE `+cond, args...).
 		Scan(&total, &sumW); err != nil {
 		writeErr(w, 500, "汇总失败: "+err.Error())
 		return
 	}
-	rows, err := db.Query(`SELECT id, barcode, name, category, purity, weight_g, price, status
-		FROM item WHERE `+cond+` ORDER BY id DESC LIMIT 500`, args...)
+	rows, err := db.Query(`SELECT it.id, it.barcode, it.name, it.category, it.purity, it.weight_g, it.price, it.status,
+		CASE WHEN it.location_type='总库' THEN '总库' ELSE COALESCE(dst.name,'未知分销商') END
+		FROM item it LEFT JOIN distributor dst ON dst.id = it.distributor_id
+		WHERE `+cond+` ORDER BY it.id DESC LIMIT 500`, args...)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
@@ -2350,7 +2948,7 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 	list := []Item{}
 	for rows.Next() {
 		var it Item
-		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Category, &it.Purity, &it.WeightG, &it.Price, &it.Status); err != nil {
+		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Category, &it.Purity, &it.WeightG, &it.Price, &it.Status, &it.Location); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -2792,6 +3390,14 @@ func main() {
 	mux.HandleFunc("POST /api/doc/sale-return/unconfirm", withAuth(handleSaleReturnUnconfirm))
 	mux.HandleFunc("POST /api/doc/sale-return/delete", withAuth(handleSaleReturnDelete))
 	mux.HandleFunc("GET /api/doc/sale-return", withAuth(handleSaleReturnList))
+	mux.HandleFunc("GET /api/distributors", withAuth(handleDistributorList))
+	mux.HandleFunc("POST /api/distributors", withAuth(handleDistributorCreate))
+	mux.HandleFunc("POST /api/distributors/update", withAuth(handleDistributorUpdate))
+	mux.HandleFunc("POST /api/doc/transfer/save", withAuth(handleTransferSave))
+	mux.HandleFunc("POST /api/doc/transfer/confirm", withAuth(handleTransferConfirm))
+	mux.HandleFunc("POST /api/doc/transfer/unconfirm", withAuth(handleTransferUnconfirm))
+	mux.HandleFunc("POST /api/doc/transfer/delete", withAuth(handleTransferDelete))
+	mux.HandleFunc("GET /api/doc/transfer", withAuth(handleTransferList))
 
 	fmt.Println("后端已启动: http://localhost:8080/api/health  (Ctrl+C 停止)")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

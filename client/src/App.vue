@@ -23,6 +23,7 @@ interface Item {
   weightG: number
   price?: number
   status: string
+  location?: string
 }
 const items = ref<Item[]>([])
 const itemsTotal = ref(0)
@@ -31,6 +32,7 @@ const itemsSumW = ref(0)
 const fStatus = ref('')
 const fCategory = ref('')
 const fKeyword = ref('')
+const fLoc = ref('') // ''=全部 '0'=总库 其他=分销商id
 
 // ===== 单据列表 =====
 interface Doc {
@@ -271,6 +273,180 @@ function slEdit(d: SDoc) {
   slLines.value = d.lines.map(l => ({ ...l }))
   slSalespersonId.value = d.salespersonId || 0
   slPays.value = (d.payments ?? []).map(p => ({ ...p }))
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+// ===== 分销商与调拨单（v0.18） =====
+interface Distributor {
+  id: number
+  name: string
+  status: number
+}
+const distributors = ref<Distributor[]>([])
+const showDists = ref(false)
+const ndistName = ref('')
+const enabledDists = () => distributors.value.filter(d => d.status === 1)
+
+async function createDist() {
+  errMsg.value = ''
+  try {
+    await api.distributorCreate(ndistName.value)
+    flash(`已新增分销商：${ndistName.value}`)
+    ndistName.value = ''
+    const r = await api.distributorList()
+    distributors.value = r.list
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function toggleDist(d: Distributor) {
+  errMsg.value = ''
+  try {
+    await api.distributorUpdate({ id: d.id, status: d.status === 1 ? 0 : 1 })
+    flash(`${d.name} 已${d.status === 1 ? '停用' : '启用'}`)
+    const r = await api.distributorList()
+    distributors.value = r.list
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function saveDist(d: Distributor) {
+  errMsg.value = ''
+  try {
+    await api.distributorUpdate({ id: d.id, name: d.name })
+    flash(`分销商已保存：${d.name}`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    const r = await api.distributorList()
+    distributors.value = r.list
+  }
+}
+
+interface TDoc {
+  id: number
+  docNo: string
+  status: string
+  fromDistributorId: number
+  fromName: string
+  toDistributorId: number
+  toName: string
+  lines: { barcode: string; name: string; purity: string; weightG: number }[]
+  madeAt: string
+}
+const tdocs = ref<TDoc[]>([])
+const tfEditingId = ref(0)
+const tfEditingNo = ref('')
+const tfFrom = ref(0) // 0=总库
+const tfTo = ref(0)
+const tfInput = ref('')
+const tfBarcodes = ref<{ barcode: string; name: string; location: string }[]>([])
+
+function tfReset() {
+  tfEditingId.value = 0
+  tfEditingNo.value = ''
+  tfFrom.value = 0
+  tfTo.value = 0
+  tfInput.value = ''
+  tfBarcodes.value = []
+}
+function tfLocName(id: number): string {
+  if (!id) return '总库'
+  return distributors.value.find(d => d.id === id)?.name ?? '?'
+}
+function tfAdd() {
+  const bc = tfInput.value.trim().toUpperCase()
+  if (!bc) return
+  if (tfBarcodes.value.some(x => x.barcode === bc)) {
+    errMsg.value = `条码 ${bc} 已在本单中`
+    return
+  }
+  const it = items.value.find(x => x.barcode === bc)
+  if (it) {
+    if (it.status !== '在库') {
+      errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能调拨`
+      return
+    }
+    if ((it.location ?? '总库') !== tfLocName(tfFrom.value)) {
+      errMsg.value = `条码 ${bc} 在「${it.location}」处，不在调出方「${tfLocName(tfFrom.value)}」`
+      return
+    }
+  }
+  // 不在当前列表里（可能被筛选条件滤掉了）也允许先加——保存时服务端把关
+  tfBarcodes.value.push({ barcode: bc, name: it?.name ?? '', location: it?.location ?? '' })
+  tfInput.value = ''
+  errMsg.value = ''
+}
+function tfRemove(i: number) {
+  tfBarcodes.value.splice(i, 1)
+}
+async function tfSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.transferSave({
+      id: tfEditingId.value,
+      fromDistributorId: tfFrom.value,
+      toDistributorId: tfTo.value,
+      barcodes: tfBarcodes.value.map(x => x.barcode),
+    })
+    const id = tfEditingId.value || r.id
+    if (!tfEditingId.value) {
+      tfEditingId.value = r.id
+      tfEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      await api.transferConfirm(id)
+      flash(`调拨已确认：${tfEditingNo.value}（${tfLocName(tfFrom.value)} → ${tfLocName(tfTo.value)}）`)
+      tfReset()
+    } else {
+      flash(`调拨草稿已保存：${tfEditingNo.value}`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function tfConfirmDoc(d: TDoc) {
+  errMsg.value = ''
+  try {
+    await api.transferConfirm(d.id)
+    flash(`调拨已确认：${d.docNo}`)
+    if (tfEditingId.value === d.id) tfReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function tfUnconfirmDoc(d: TDoc) {
+  errMsg.value = ''
+  try {
+    await api.transferUnconfirm(d.id)
+    flash(`调拨已反确认：${d.docNo}，货品拉回「${d.fromName}」待处理`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function tfDeleteDoc(d: TDoc) {
+  errMsg.value = ''
+  try {
+    await api.transferDelete(d.id)
+    flash(`调拨草稿 ${d.docNo} 已删除`)
+    if (tfEditingId.value === d.id) tfReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function tfEdit(d: TDoc) {
+  tfEditingId.value = d.id
+  tfEditingNo.value = d.docNo
+  tfFrom.value = d.fromDistributorId || 0
+  tfTo.value = d.toDistributorId || 0
+  tfBarcodes.value = d.lines.map(l => ({ barcode: l.barcode, name: l.name, location: '' }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -771,9 +947,13 @@ async function refreshAll() {
   if (fStatus.value) params.status = fStatus.value
   if (fCategory.value) params.category = fCategory.value
   if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
-  const [ri, rd, ro, rs, rr] = await Promise.all([
+  if (fLoc.value !== '') params.loc = fLoc.value
+  const [ri, rd, ro, rs, rr, rt, rdist] = await Promise.all([
     api.items(params), api.inboundList(), api.outboundList(), api.saleList(), api.saleReturnList(),
+    api.transferList(), api.distributorList(),
   ])
+  tdocs.value = rt.list
+  distributors.value = rdist.list
   items.value = ri.list
   itemsTotal.value = ri.total
   itemsSumW.value = ri.sumWeightG
@@ -916,6 +1096,7 @@ function editDoc(d: Doc) {
         <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
         <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
         <button v-if="isAdmin" class="mini" @click="showSps = !showSps">售货员</button>
+        <button v-if="isAdmin" class="mini" @click="showDists = !showDists">分销商</button>
         <button class="mini" @click="doLogout">退出登录</button>
       </p>
       <div v-if="showPwd" class="card">
@@ -987,6 +1168,33 @@ function editDoc(d: Doc) {
           <button @click="createSp">新增售货员</button>
         </div>
         <p class="hint">售货员是销售档案，与登录账号是两回事。单据按编号引用售货员，所以改名是安全的（这点与字典相反）。离职只停用不删除。</p>
+      </section>
+
+      <!-- 分销商维护（仅管理员可见，v0.18） -->
+      <section v-if="isAdmin && showDists" class="card">
+        <h2>分销商维护</h2>
+        <table>
+          <thead>
+            <tr><th>名称</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="d in distributors" :key="d.id">
+              <td><input v-model="d.name" style="width:160px" /></td>
+              <td>{{ d.status === 1 ? '启用' : '已停用' }}</td>
+              <td>
+                <button class="mini" @click="saveDist(d)">保存</button>
+                <button :class="['mini', d.status === 1 ? 'danger' : '']" @click="toggleDist(d)">
+                  {{ d.status === 1 ? '停用' : '启用' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <label>名称 <input v-model="ndistName" /></label>
+          <button @click="createDist">新增分销商</button>
+        </div>
+        <p class="hint">分销商（门店/下级代理）只停用不删除；单据按编号引用，改名安全。停用后不能作为调拨的调出/调入方。</p>
       </section>
 
       <!-- 用户管理（仅管理员可见） -->
@@ -1160,6 +1368,83 @@ function editDoc(d: Doc) {
                 <td>{{ l.name }}</td>
                 <td style="width:90px">{{ l.mode }}</td>
                 <td style="width:110px">¥{{ Number(l.soldPrice ?? 0).toFixed(2) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 调拨单（v0.18） -->
+      <section class="card">
+        <h2>
+          {{ tfEditingId ? `编辑调拨草稿 ${tfEditingNo}` : '调拨单（分货/退总库/互调）' }}
+          <button v-if="tfEditingId" class="mini" @click="tfReset">放弃，新建</button>
+        </h2>
+        <div class="row">
+          <label>调出方
+            <select v-model.number="tfFrom">
+              <option :value="0">总库</option>
+              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
+          <span>→</span>
+          <label>调入方
+            <select v-model.number="tfTo">
+              <option :value="0">总库</option>
+              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
+          <label>条码 <input v-model="tfInput" placeholder="扫码或输入后回车" @keyup.enter="tfAdd" class="mono" /></label>
+          <button class="mini" @click="tfAdd">添加</button>
+        </div>
+        <table v-if="tfBarcodes.length">
+          <thead>
+            <tr><th>#</th><th>条码</th><th>名称</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(x, i) in tfBarcodes" :key="x.barcode">
+              <td>{{ i + 1 }}</td>
+              <td class="mono">{{ x.barcode }}</td>
+              <td>{{ x.name || '—' }}</td>
+              <td><button class="mini" @click="tfRemove(i)">删行</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row" v-if="tfBarcodes.length">
+          <p class="ok" style="margin:0">共 {{ tfBarcodes.length }} 件：{{ tfLocName(tfFrom) }} → {{ tfLocName(tfTo) }}</p>
+          <span class="spacer"></span>
+          <button class="gray" @click="tfSave(false)">保存草稿</button>
+          <button @click="tfSave(true)">确认调拨</button>
+        </div>
+        <p class="hint">同一张单覆盖三种用法：总库→分销商＝分货；分销商→总库＝退回；分销商→分销商＝互调。草稿即占用（调拨中）。</p>
+      </section>
+
+      <!-- 调拨单列表 -->
+      <section class="card" v-if="tdocs.length">
+        <h2>调拨单列表（{{ tdocs.length }} 张）</h2>
+        <div v-for="d in tdocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span>{{ d.fromName }} → {{ d.toName }}</span>
+            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="tfEdit(d)">编辑</button>
+              <button class="mini" @click="tfConfirmDoc(d)">确认调拨</button>
+              <button class="mini danger" @click="tfDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini danger" @click="tfUnconfirmDoc(d)">反确认</button>
+            </template>
+          </div>
+          <table v-if="d.lines?.length">
+            <tbody>
+              <tr v-for="(l, j) in d.lines" :key="j">
+                <td class="mono" style="width:160px">{{ l.barcode }}</td>
+                <td>{{ l.name }}</td>
+                <td style="width:110px">{{ l.purity }}</td>
+                <td style="width:90px">{{ (l.weightG ?? 0).toFixed(2) }}g</td>
               </tr>
             </tbody>
           </table>
@@ -1393,8 +1678,15 @@ function editDoc(d: Doc) {
 
       <!-- 库存 -->
       <section class="card">
-        <h2>总库库存</h2>
+        <h2>库存查询</h2>
         <div class="row">
+          <label>位置
+            <select v-model="fLoc" @change="refreshAll">
+              <option value="">全部</option>
+              <option value="0">总库</option>
+              <option v-for="d in distributors" :key="d.id" :value="String(d.id)">{{ d.name }}</option>
+            </select>
+          </label>
           <label>状态
             <select v-model="fStatus" @change="refreshAll">
               <option value="">全部</option>
@@ -1402,6 +1694,7 @@ function editDoc(d: Doc) {
               <option>销售中</option>
               <option>退库中</option>
               <option>退货中</option>
+              <option>调拨中</option>
               <option>已售</option>
               <option>已退库</option>
             </select>
@@ -1419,7 +1712,7 @@ function editDoc(d: Doc) {
         <p class="ok">共 {{ itemsTotal }} 件 · 合计克重 {{ itemsSumW.toFixed(2) }} g</p>
         <table>
           <thead>
-            <tr><th>条码号</th><th>首饰名称</th><th>大类</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>状态</th></tr>
+            <tr><th>条码号</th><th>首饰名称</th><th>大类</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>位置</th><th>状态</th></tr>
           </thead>
           <tbody>
             <tr v-for="it in items" :key="it.id">
@@ -1429,6 +1722,7 @@ function editDoc(d: Doc) {
               <td>{{ it.purity }}</td>
               <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
               <td>{{ (it.price ?? 0) > 0 ? (it.price ?? 0).toFixed(0) : '—' }}</td>
+              <td>{{ it.location ?? '总库' }}</td>
               <td>{{ it.status }}</td>
             </tr>
           </tbody>

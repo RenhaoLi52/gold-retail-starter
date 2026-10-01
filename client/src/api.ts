@@ -105,6 +105,16 @@ export const api = {
   dictCreate: (payload: unknown) => request('POST', '/api/dict', payload),
   dictUpdate: (payload: unknown) => request('POST', '/api/dict/update', payload),
 
+  // 分销商与调拨单（v0.18）
+  distributorList: () => request('GET', '/api/distributors'),
+  distributorCreate: (name: string) => request('POST', '/api/distributors', { name }),
+  distributorUpdate: (payload: unknown) => request('POST', '/api/distributors/update', payload),
+  transferSave: (payload: unknown) => request('POST', '/api/doc/transfer/save', payload),
+  transferConfirm: (id: number) => request('POST', '/api/doc/transfer/confirm', { id }),
+  transferUnconfirm: (id: number) => request('POST', '/api/doc/transfer/unconfirm', { id }),
+  transferDelete: (id: number) => request('POST', '/api/doc/transfer/delete', { id }),
+  transferList: () => request('GET', '/api/doc/transfer'),
+
   // 售货员档案（读取所有人；增改仅管理员）
   salespersonList: () => request('GET', '/api/salespersons'),
   salespersonCreate: (name: string, sort: number) =>
