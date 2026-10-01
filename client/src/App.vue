@@ -42,6 +42,56 @@ interface Line {
   purity: string
   weightG: number | null
 }
+// ===== 基础资料字典 =====
+interface DictItem {
+  id: number
+  name: string
+  sort: number
+  enabled: boolean
+}
+const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [] })
+const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别' }
+const dictTab = ref('category')
+const showDicts = ref(false)
+const ndName = ref('')
+const ndSort = ref(0)
+
+async function loadDicts() {
+  const [c, pu, j] = await Promise.all([
+    api.dictList('category'), api.dictList('purity'), api.dictList('jewel_type'),
+  ])
+  dicts.value = { category: c.list, purity: pu.list, jewel_type: j.list }
+}
+// 开单下拉只用启用项
+const enabledCats = () => dicts.value.category.filter(d => d.enabled)
+const enabledPurities = () => dicts.value.purity.filter(d => d.enabled)
+
+async function createDict() {
+  errMsg.value = ''
+  try {
+    await api.dictCreate({
+      dictType: dictTab.value,
+      name: ndName.value,
+      sort: Number(ndSort.value) || 0,
+    })
+    flash(`已新增${dictLabels[dictTab.value]}：${ndName.value}`)
+    ndName.value = ''
+    await loadDicts()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function toggleDict(d: DictItem) {
+  errMsg.value = ''
+  try {
+    await api.dictUpdate({ id: d.id, enabled: !d.enabled })
+    flash(`${d.name} 已${d.enabled ? '停用' : '启用'}`)
+    await loadDicts()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 // ===== 用户管理（仅管理员） =====
 interface User {
   id: number
@@ -157,6 +207,7 @@ async function refreshAll() {
   const [ri, rd] = await Promise.all([api.items(), api.inboundList()])
   items.value = ri.list
   docs.value = rd.list
+  await loadDicts()
 }
 
 function addLine() {
@@ -285,6 +336,7 @@ function editDoc(d: Doc) {
         当前用户：{{ userLabel }}
         <button class="mini" @click="showPwd = !showPwd">修改密码</button>
         <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
+        <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
       </p>
       <div v-if="showPwd" class="card">
         <div class="row">
@@ -295,6 +347,38 @@ function editDoc(d: Doc) {
       </div>
       <p v-if="okMsg" class="ok">{{ okMsg }}</p>
       <p v-if="errMsg" class="err">{{ errMsg }}</p>
+
+      <!-- 基础资料（仅管理员可见） -->
+      <section v-if="isAdmin && showDicts" class="card">
+        <h2>
+          基础资料
+          <button v-for="(label, t) in dictLabels" :key="t" class="mini"
+            :style="dictTab === t ? 'background:#2f7d4f' : ''" @click="dictTab = t">{{ label }}</button>
+        </h2>
+        <table>
+          <thead>
+            <tr><th>名称</th><th>排序</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="d in dicts[dictTab]" :key="d.id">
+              <td>{{ d.name }}</td>
+              <td>{{ d.sort }}</td>
+              <td>{{ d.enabled ? '启用' : '已停用' }}</td>
+              <td>
+                <button :class="['mini', d.enabled ? 'danger' : '']" @click="toggleDict(d)">
+                  {{ d.enabled ? '停用' : '启用' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <label>名称 <input v-model="ndName" /></label>
+          <label>排序 <input v-model.number="ndSort" type="number" style="width:70px" /></label>
+          <button @click="createDict">新增{{ dictLabels[dictTab] }}</button>
+        </div>
+        <p class="hint">字典只停用不删除——历史单据和货品引用着这些名字。改名也暂不开放，避免历史数据失去解释。</p>
+      </section>
 
       <!-- 用户管理（仅管理员可见） -->
       <section v-if="isAdmin && showUsers" class="card">
@@ -335,7 +419,7 @@ function editDoc(d: Doc) {
         <div class="row">
           <label>首饰大类
             <select v-model="category">
-              <option>黄金</option><option>玉器类</option><option>钻石类</option><option>万足银(克)</option>
+              <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
             </select>
           </label>
         </div>
@@ -348,7 +432,11 @@ function editDoc(d: Doc) {
               <td>{{ i + 1 }}</td>
               <td><input v-model="l.barcode" placeholder="自动生成" /></td>
               <td><input v-model="l.name" /></td>
-              <td><input v-model="l.purity" /></td>
+              <td>
+                <select v-model="l.purity">
+                  <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
+                </select>
+              </td>
               <td><input v-model.number="l.weightG" type="number" step="0.01" /></td>
               <td><button class="mini" @click="removeLine(i)" :disabled="lines.length === 1">删行</button></td>
             </tr>

@@ -37,6 +37,11 @@ export const api = {
   changePassword: (oldPassword: string, newPassword: string) =>
     request('POST', '/api/me/password', { oldPassword, newPassword }),
 
+  // 基础资料字典
+  dictList: (type: string) => request('GET', `/api/dict?type=${type}`),
+  dictCreate: (payload: unknown) => request('POST', '/api/dict', payload),
+  dictUpdate: (payload: unknown) => request('POST', '/api/dict/update', payload),
+
   // 用户管理（仅管理员）
   userList: () => request('GET', '/api/users'),
   userCreate: (username: string, name: string, password: string) =>

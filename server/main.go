@@ -524,6 +524,111 @@ func handleUserResetPwd(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "密码已重置"})
 }
 
+
+// ===== 基础资料字典（v0.6） =====
+// 三个字典（大类/成色/类别）共用一张表、一套接口——与单据引擎同源的复用思想。
+// 读取：所有登录用户；新增/修改：仅管理员。只停用不删除。
+
+var validDictTypes = map[string]bool{"category": true, "purity": true, "jewel_type": true}
+
+// GET /api/dict?type=category —— 读取某字典（含停用项，前端下拉自行过滤 enabled）
+func handleDictList(w http.ResponseWriter, r *http.Request) {
+	dt := r.URL.Query().Get("type")
+	if !validDictTypes[dt] {
+		writeErr(w, 400, "未知字典类型")
+		return
+	}
+	rows, err := db.Query(`SELECT id, name, sort, enabled
+		FROM dict_item WHERE dict_type=$1 ORDER BY sort, id`, dt)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type D struct {
+		ID      int64  `json:"id"`
+		Name    string `json:"name"`
+		Sort    int    `json:"sort"`
+		Enabled bool   `json:"enabled"`
+	}
+	list := []D{}
+	for rows.Next() {
+		var d D
+		if err := rows.Scan(&d.ID, &d.Name, &d.Sort, &d.Enabled); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// POST /api/dict —— 新增字典项（管理员）
+func handleDictCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		DictType string `json:"dictType"`
+		Name     string `json:"name"`
+		Sort     int    `json:"sort"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if !validDictTypes[req.DictType] {
+		writeErr(w, 400, "未知字典类型")
+		return
+	}
+	if req.Name == "" || len([]rune(req.Name)) > 20 {
+		writeErr(w, 400, "名称不能为空且不超过20字")
+		return
+	}
+	var id int64
+	err := db.QueryRow(`INSERT INTO dict_item (dict_type, name, sort)
+		VALUES ($1,$2,$3) RETURNING id`, req.DictType, req.Name, req.Sort).Scan(&id)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") {
+			writeErr(w, 400, "该名称已存在")
+			return
+		}
+		writeErr(w, 500, "创建失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+// POST /api/dict/update —— 修改排序/停用启用/销售模式（管理员；不支持改名，历史数据引用着名字）
+func handleDictUpdate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID      int64 `json:"id"`
+		Sort    *int  `json:"sort"`
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if req.Sort != nil {
+		if _, err := db.Exec(`UPDATE dict_item SET sort=$1 WHERE id=$2`, *req.Sort, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	if req.Enabled != nil {
+		if _, err := db.Exec(`UPDATE dict_item SET enabled=$1 WHERE id=$2`, *req.Enabled, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT id, barcode, name, purity, weight_g, status
@@ -560,6 +665,16 @@ func handleInboundSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Category == "" {
 		req.Category = "黄金"
+	}
+	var catOK bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item
+		WHERE dict_type='category' AND name=$1 AND enabled=true)`, req.Category).Scan(&catOK); err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if !catOK {
+		writeErr(w, 400, "首饰大类「"+req.Category+"」不存在或已停用")
+		return
 	}
 	lines, err := normalizeLines(req.Lines)
 	if err != nil {
@@ -932,6 +1047,9 @@ func main() {
 	mux.HandleFunc("POST /api/login", withCORS(handleLogin))
 	mux.HandleFunc("OPTIONS /api/", withCORS(func(w http.ResponseWriter, r *http.Request) {}))
 	mux.HandleFunc("POST /api/me/password", withAuth(handleChangePassword))
+	mux.HandleFunc("GET /api/dict", withAuth(handleDictList))
+	mux.HandleFunc("POST /api/dict", withAuth(handleDictCreate))
+	mux.HandleFunc("POST /api/dict/update", withAuth(handleDictUpdate))
 	mux.HandleFunc("GET /api/users", withAuth(handleUserList))
 	mux.HandleFunc("POST /api/users", withAuth(handleUserCreate))
 	mux.HandleFunc("POST /api/users/status", withAuth(handleUserStatus))
