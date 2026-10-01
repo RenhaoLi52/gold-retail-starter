@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -1038,6 +1039,66 @@ func handleCommissionRuleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]any{"id": req.ID})
+}
+
+// GET /api/commission-report?from=YYYY-MM-DD&to=YYYY-MM-DD —— 提成报表（管理员）
+// 报表=对台账做SUM，没有任何新的计算逻辑；台账是确认时刻的快照，报表永远可复算。
+func handleCommissionReport(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	from := strings.TrimSpace(r.URL.Query().Get("from"))
+	to := strings.TrimSpace(r.URL.Query().Get("to"))
+	if from == "" || to == "" {
+		writeErr(w, 400, "请指定起止日期")
+		return
+	}
+	rows, err := db.Query(`SELECT sp.id, sp.name, COALESCE(d.name,'总部'), sp.role,
+		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='销售'), 0),
+		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='店长抽成'), 0),
+		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='销退冲减'), 0),
+		COALESCE(SUM(cf.amount), 0),
+		COUNT(DISTINCT cf.doc_id) FILTER (WHERE cf.kind='销售')
+		FROM commission_flow cf
+		JOIN salesperson sp ON sp.id = cf.salesperson_id
+		LEFT JOIN distributor d ON d.id = sp.distributor_id
+		WHERE cf.created_at >= $1::date AND cf.created_at < ($2::date + 1)
+		GROUP BY sp.id, sp.name, d.name, sp.role
+		ORDER BY 8 DESC`, from, to)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type Row struct {
+		SalespersonID int64   `json:"salespersonId"`
+		Name          string  `json:"name"`
+		StoreName     string  `json:"storeName"`
+		Role          string  `json:"role"`
+		SaleComm      float64 `json:"saleComm"`
+		ManagerComm   float64 `json:"managerComm"`
+		ReturnOffset  float64 `json:"returnOffset"`
+		Net           float64 `json:"net"`
+		DocCount      int     `json:"docCount"`
+	}
+	list := []Row{}
+	var tSale, tMgr, tRet, tNet float64
+	for rows.Next() {
+		var x Row
+		if err := rows.Scan(&x.SalespersonID, &x.Name, &x.StoreName, &x.Role,
+			&x.SaleComm, &x.ManagerComm, &x.ReturnOffset, &x.Net, &x.DocCount); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		tSale += x.SaleComm
+		tMgr += x.ManagerComm
+		tRet += x.ReturnOffset
+		tNet += x.Net
+		list = append(list, x)
+	}
+	writeJSON(w, 200, map[string]any{"list": list,
+		"totalSale": round2(tSale), "totalManager": round2(tMgr),
+		"totalReturn": round2(tRet), "totalNet": round2(tNet)})
 }
 
 // spInfo 确认时用到的售货员信息
@@ -2084,8 +2145,10 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认", "totalAmount": round2(total)})
 }
 
+// round2 四舍五入到分。踩坑10：旧实现 int64(v*100+0.5) 对负数向零截断，
+// round2(-30) 会得到 -29.99——销退冲减出现负数合计后才暴露。math.Round 对正负都正确。
 func round2(v float64) float64 {
-	return float64(int64(v*100+0.5)) / 100
+	return math.Round(v*100) / 100
 }
 
 func currentGoldPriceTx(tx *sql.Tx, purity string) (float64, bool, error) {
@@ -3960,6 +4023,7 @@ func main() {
 	mux.HandleFunc("GET /api/dict", withAuth(handleDictList))
 	mux.HandleFunc("POST /api/dict", withAuth(handleDictCreate))
 	mux.HandleFunc("POST /api/dict/update", withAuth(handleDictUpdate))
+	mux.HandleFunc("GET /api/commission-report", withAuth(handleCommissionReport))
 	mux.HandleFunc("GET /api/commission-rules", withAuth(handleCommissionRuleList))
 	mux.HandleFunc("POST /api/commission-rules", withAuth(handleCommissionRuleCreate))
 	mux.HandleFunc("POST /api/commission-rules/update", withAuth(handleCommissionRuleUpdate))

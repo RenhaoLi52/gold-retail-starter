@@ -466,6 +466,40 @@ function tfEdit(d: TDoc) {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
+// ===== 提成报表（仅管理员，v0.21） =====
+interface CommRow {
+  salespersonId: number
+  name: string
+  storeName: string
+  role: string
+  saleComm: number
+  managerComm: number
+  returnOffset: number
+  net: number
+  docCount: number
+}
+const showReport = ref(false)
+const crRows = ref<CommRow[]>([])
+const crTotals = ref({ sale: 0, mgr: 0, ret: 0, net: 0 })
+const today = new Date().toISOString().slice(0, 10)
+const crFrom = ref(today.slice(0, 8) + '01') // 本月1号
+const crTo = ref(today)
+
+async function toggleReport() {
+  showReport.value = !showReport.value
+  if (showReport.value) await loadReport()
+}
+async function loadReport() {
+  errMsg.value = ''
+  try {
+    const r = await api.commissionReport(crFrom.value, crTo.value)
+    crRows.value = r.list
+    crTotals.value = { sale: r.totalSale, mgr: r.totalManager, ret: r.totalReturn, net: r.totalNet }
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 // ===== 销退单（v0.17） =====
 interface SRLine {
   barcode: string
@@ -1210,6 +1244,7 @@ function editDoc(d: Doc) {
         <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
         <button v-if="isAdmin" class="mini" @click="showSps = !showSps">售货员</button>
         <button v-if="isAdmin" class="mini" @click="toggleRules">提成规则</button>
+        <button v-if="isAdmin" class="mini" @click="toggleReport">提成报表</button>
         <button v-if="isAdmin" class="mini" @click="showDists = !showDists">分销商</button>
         <button class="mini" @click="doLogout">退出登录</button>
       </p>
@@ -1364,6 +1399,43 @@ function editDoc(d: Doc) {
           <button @click="createRule">新增规则</button>
         </div>
         <p class="hint">每个"大类×结算方式"一条规则；没配规则的货没有提成（不报错）。改规则只影响之后确认的单——已入账的提成是确认时刻的快照。</p>
+      </section>
+
+      <!-- 提成报表（仅管理员可见，v0.21） -->
+      <section v-if="isAdmin && showReport" class="card">
+        <h2>提成报表</h2>
+        <div class="row">
+          <label>从 <input v-model="crFrom" type="date" /></label>
+          <label>到 <input v-model="crTo" type="date" /></label>
+          <button @click="loadReport">查询</button>
+        </div>
+        <table v-if="crRows.length">
+          <thead>
+            <tr><th>售货员</th><th>门店</th><th>角色</th><th>成交单数</th><th>销售提成</th><th>店长抽成</th><th>销退冲减</th><th>净提成</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="x in crRows" :key="x.salespersonId">
+              <td>{{ x.name }}</td>
+              <td>{{ x.storeName }}</td>
+              <td>{{ x.role }}</td>
+              <td>{{ x.docCount }}</td>
+              <td>¥{{ x.saleComm.toFixed(2) }}</td>
+              <td>{{ x.managerComm ? '¥' + x.managerComm.toFixed(2) : '—' }}</td>
+              <td :style="x.returnOffset < 0 ? 'color:#c0392b' : ''">
+                {{ x.returnOffset ? '¥' + x.returnOffset.toFixed(2) : '—' }}</td>
+              <td><b>¥{{ x.net.toFixed(2) }}</b></td>
+            </tr>
+            <tr style="border-top:2px solid #999">
+              <td colspan="4"><b>合计</b></td>
+              <td><b>¥{{ crTotals.sale.toFixed(2) }}</b></td>
+              <td><b>¥{{ crTotals.mgr.toFixed(2) }}</b></td>
+              <td :style="crTotals.ret < 0 ? 'color:#c0392b' : ''"><b>¥{{ crTotals.ret.toFixed(2) }}</b></td>
+              <td><b>¥{{ crTotals.net.toFixed(2) }}</b></td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="hint">该期间没有提成记录。</p>
+        <p class="hint">净提成 = 销售提成 + 店长抽成 + 销退冲减（冲减为负数）。按台账入账时间统计。</p>
       </section>
 
       <!-- 分销商维护（仅管理员可见，v0.18） -->

@@ -121,6 +121,8 @@ export const api = {
   salespersonUpdate: (payload: unknown) => request('POST', '/api/salespersons/update', payload),
 
   // 提成规则（仅管理员，v0.20）
+  commissionReport: (from: string, to: string) =>
+    request('GET', `/api/commission-report?from=${from}&to=${to}`),
   commissionRuleList: () => request('GET', '/api/commission-rules'),
   commissionRuleCreate: (payload: unknown) => request('POST', '/api/commission-rules', payload),
   commissionRuleUpdate: (payload: unknown) => request('POST', '/api/commission-rules/update', payload),
