@@ -26,7 +26,10 @@ async function request(method: string, path: string, body?: unknown) {
 export const api = {
   login: (username: string, password: string) =>
     request('POST', '/api/login', { username, password }),
-  items: () => request('GET', '/api/items'),
+  items: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : ''
+    return request('GET', '/api/items' + qs)
+  },
 
   // 入库单：单据生命周期四件套 + 列表
   inboundSave: (payload: unknown) => request('POST', '/api/doc/inbound/save', payload),
@@ -42,6 +45,12 @@ export const api = {
 
   changePassword: (oldPassword: string, newPassword: string) =>
     request('POST', '/api/me/password', { oldPassword, newPassword }),
+
+  // 金价
+  goldPriceCurrent: () => request('GET', '/api/gold-price/current'),
+  goldPriceHistory: () => request('GET', '/api/gold-price/history'),
+  goldPricePublish: (purity: string, retailPrice: number, recyclePrice: number) =>
+    request('POST', '/api/gold-price', { purity, retailPrice, recyclePrice }),
 
   // 基础资料字典
   dictList: (type: string) => request('GET', `/api/dict?type=${type}`),

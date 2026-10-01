@@ -39,12 +39,14 @@ import (
 // ===== 数据结构 =====
 
 type Item struct {
-	ID      int64   `json:"id"`
-	Barcode string  `json:"barcode"`
-	Name    string  `json:"name"`
-	Purity  string  `json:"purity"`
-	WeightG float64 `json:"weightG"`
-	Status  string  `json:"status"`
+	ID       int64   `json:"id"`
+	Barcode  string  `json:"barcode"`
+	Name     string  `json:"name"`
+	Category string  `json:"category,omitempty"`
+	Purity   string  `json:"purity"`
+	WeightG  float64 `json:"weightG"`
+	Price    float64 `json:"price"`
+	Status   string  `json:"status"`
 }
 
 // DraftLine 草稿明细行（存进 doc.draft_lines 的 JSON 结构，字段名与前端一致）
@@ -53,6 +55,7 @@ type DraftLine struct {
 	Name    string  `json:"name"`
 	Purity  string  `json:"purity"`
 	WeightG float64 `json:"weightG"`
+	Price   float64 `json:"price"` // 售价(标签价)，0=未定价
 }
 
 type InboundDoc struct {
@@ -227,6 +230,9 @@ func normalizeLines(lines []DraftLine) ([]DraftLine, error) {
 		}
 		if l.WeightG <= 0 {
 			return nil, fmt.Errorf("第%d行总件重必须大于0", i+1)
+		}
+		if l.Price < 0 {
+			return nil, fmt.Errorf("第%d行售价不能为负数", i+1)
 		}
 		out = append(out, l)
 	}
@@ -661,8 +667,8 @@ func handleOutboundSave(w http.ResponseWriter, r *http.Request) {
 		seen[bc] = true
 		var l DraftLine
 		var status string
-		err := db.QueryRow(`SELECT name, purity, weight_g, status FROM item WHERE barcode=$1`, bc).
-			Scan(&l.Name, &l.Purity, &l.WeightG, &status)
+		err := db.QueryRow(`SELECT name, purity, weight_g, price, status FROM item WHERE barcode=$1`, bc).
+			Scan(&l.Name, &l.Purity, &l.WeightG, &l.Price, &status)
 		if err == sql.ErrNoRows {
 			writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", bc))
 			return
@@ -930,16 +936,156 @@ func handleOutboundList(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(drafts[docs[i].ID], &lines)
 		for _, l := range lines {
 			docs[i].Items = append(docs[i].Items, Item{Barcode: l.Barcode, Name: l.Name,
-				Purity: l.Purity, WeightG: l.WeightG, Status: docs[i].Status})
+				Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: docs[i].Status})
 		}
 	}
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
 }
 
-func handleItems(w http.ResponseWriter, r *http.Request) {
+// ===== 金价发布（v0.10） =====
+// 只追加不修改：当前价=每成色最新一条；历史可查；销售时将快照进单据。
+
+// GET /api/gold-price/current —— 每个成色的最新价（所有登录用户，开单要用）
+func handleGoldPriceCurrent(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT id, barcode, name, purity, weight_g, status
-		FROM item ORDER BY id DESC LIMIT 500`)
+		SELECT DISTINCT ON (gp.purity) gp.purity, gp.retail_price, gp.recycle_price,
+		       u.name, to_char(gp.published_at,'MM-DD HH24:MI')
+		FROM gold_price gp JOIN app_user u ON u.id = gp.published_by
+		ORDER BY gp.purity, gp.id DESC`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type P struct {
+		Purity       string  `json:"purity"`
+		RetailPrice  float64 `json:"retailPrice"`
+		RecyclePrice float64 `json:"recyclePrice"`
+		By           string  `json:"by"`
+		At           string  `json:"at"`
+	}
+	list := []P{}
+	for rows.Next() {
+		var x P
+		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.By, &x.At); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, x)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// GET /api/gold-price/history —— 最近50条发布记录
+func handleGoldPriceHistory(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT gp.purity, gp.retail_price, gp.recycle_price, u.name,
+		       to_char(gp.published_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM gold_price gp JOIN app_user u ON u.id = gp.published_by
+		ORDER BY gp.id DESC LIMIT 50`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type P struct {
+		Purity       string  `json:"purity"`
+		RetailPrice  float64 `json:"retailPrice"`
+		RecyclePrice float64 `json:"recyclePrice"`
+		By           string  `json:"by"`
+		At           string  `json:"at"`
+	}
+	list := []P{}
+	for rows.Next() {
+		var x P
+		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.By, &x.At); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, x)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// POST /api/gold-price —— 发布新价（管理员）：{purity, retailPrice, recyclePrice}
+func handleGoldPricePublish(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		Purity       string  `json:"purity"`
+		RetailPrice  float64 `json:"retailPrice"`
+		RecyclePrice float64 `json:"recyclePrice"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	req.Purity = strings.TrimSpace(req.Purity)
+	var ok bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item
+		WHERE dict_type='purity' AND name=$1 AND enabled=true)`, req.Purity).Scan(&ok); err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 400, "成色「"+req.Purity+"」不存在或已停用")
+		return
+	}
+	if req.RetailPrice <= 0 {
+		writeErr(w, 400, "零售金价必须大于0")
+		return
+	}
+	if req.RecyclePrice < 0 {
+		writeErr(w, 400, "回收金价不能为负")
+		return
+	}
+	if req.RecyclePrice > req.RetailPrice {
+		writeErr(w, 400, "回收金价不应高于零售金价，请核对")
+		return
+	}
+	var id int64
+	if err := db.QueryRow(`INSERT INTO gold_price (purity, retail_price, recycle_price, published_by)
+		VALUES ($1,$2,$3,$4) RETURNING id`,
+		req.Purity, req.RetailPrice, req.RecyclePrice, currentUID(r)).Scan(&id); err != nil {
+		writeErr(w, 500, "发布失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+func handleItems(w http.ResponseWriter, r *http.Request) {
+	// 查询参数：status(状态) category(大类) q(条码前缀或名称模糊) —— 都可选
+	q := r.URL.Query()
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(cond string, v any) {
+		args = append(args, v)
+		where = append(where, fmt.Sprintf(cond, len(args)))
+	}
+	if v := strings.TrimSpace(q.Get("status")); v != "" {
+		add("status=$%d", v)
+	}
+	if v := strings.TrimSpace(q.Get("category")); v != "" {
+		add("category=$%d", v)
+	}
+	if v := strings.TrimSpace(q.Get("q")); v != "" {
+		kw := strings.ToUpper(v)
+		args = append(args, kw+"%", "%"+v+"%")
+		where = append(where, fmt.Sprintf("(barcode LIKE $%d OR name ILIKE $%d)", len(args)-1, len(args)))
+	}
+	cond := strings.Join(where, " AND ")
+
+	// 汇总与明细用同一组条件——保证"合计"永远和看到的列表一致
+	var total int
+	var sumW float64
+	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(weight_g),0) FROM item WHERE `+cond, args...).
+		Scan(&total, &sumW); err != nil {
+		writeErr(w, 500, "汇总失败: "+err.Error())
+		return
+	}
+	rows, err := db.Query(`SELECT id, barcode, name, category, purity, weight_g, price, status
+		FROM item WHERE `+cond+` ORDER BY id DESC LIMIT 500`, args...)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
@@ -948,13 +1094,13 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 	list := []Item{}
 	for rows.Next() {
 		var it Item
-		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Purity, &it.WeightG, &it.Status); err != nil {
+		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Category, &it.Purity, &it.WeightG, &it.Price, &it.Status); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
 		list = append(list, it)
 	}
-	writeJSON(w, 200, map[string]any{"list": list, "total": len(list)})
+	writeJSON(w, 200, map[string]any{"list": list, "total": total, "sumWeightG": sumW})
 }
 
 // ===== 入库单：保存草稿 =====
@@ -1114,9 +1260,9 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		var itemID int64
 		err = tx.QueryRow(`
-			INSERT INTO item (barcode, name, category, purity, weight_g, status)
-			VALUES ($1,$2,$3,$4,$5,'在库') RETURNING id`,
-			bc, l.Name, category, l.Purity, l.WeightG).Scan(&itemID)
+			INSERT INTO item (barcode, name, category, purity, weight_g, price, status)
+			VALUES ($1,$2,$3,$4,$5,$6,'在库') RETURNING id`,
+			bc, l.Name, category, l.Purity, l.WeightG, l.Price).Scan(&itemID)
 		if err != nil {
 			writeErr(w, 500, fmt.Sprintf("第%d行写入失败: %s", i+1, err.Error()))
 			return
@@ -1133,7 +1279,7 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		doc.Items = append(doc.Items, Item{ID: itemID, Barcode: bc, Name: l.Name,
-			Purity: l.Purity, WeightG: l.WeightG, Status: "在库"})
+			Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: "在库"})
 		l.Barcode = bc
 		finalLines = append(finalLines, l)
 	}
@@ -1185,7 +1331,7 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	// 下游依赖校验：本单所有件必须仍"在库"且在总库。
 	// （将来有了销售/分销单，被引用的件状态会变，这里就会拦住并指明哪件被占用。）
 	rows, err := tx.Query(`
-		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g
+		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g, it.price
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
 	if err != nil {
@@ -1201,8 +1347,8 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int64
 		var bc, st, name, purity string
-		var wg float64
-		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg); err != nil {
+		var wg, pr float64
+		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg, &pr); err != nil {
 			rows.Close()
 			writeErr(w, 500, "明细读取失败: "+err.Error())
 			return
@@ -1213,7 +1359,7 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		itemRefs = append(itemRefs, ref{id, bc})
-		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg})
+		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg, Price: pr})
 	}
 	rows.Close()
 	if len(rebuilt) > 0 {
@@ -1304,12 +1450,12 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(drafts[docs[i].ID], &lines)
 			for _, l := range lines {
 				docs[i].Items = append(docs[i].Items, Item{Barcode: l.Barcode, Name: l.Name,
-					Purity: l.Purity, WeightG: l.WeightG, Status: "草稿"})
+					Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: "草稿"})
 			}
 			continue
 		}
 		irows, err := db.Query(`
-			SELECT it.id, it.barcode, it.name, it.purity, it.weight_g, it.status
+			SELECT it.id, it.barcode, it.name, it.purity, it.weight_g, it.price, it.status
 			FROM doc_line dl JOIN item it ON it.id = dl.item_id
 			WHERE dl.doc_id=$1 ORDER BY dl.line_no`, docs[i].ID)
 		if err != nil {
@@ -1318,7 +1464,7 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 		}
 		for irows.Next() {
 			var it Item
-			if err := irows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Purity, &it.WeightG, &it.Status); err != nil {
+			if err := irows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Purity, &it.WeightG, &it.Price, &it.Status); err != nil {
 				irows.Close()
 				writeErr(w, 500, "明细读取失败: "+err.Error())
 				return
@@ -1361,6 +1507,9 @@ func main() {
 	mux.HandleFunc("POST /api/users", withAuth(handleUserCreate))
 	mux.HandleFunc("POST /api/users/status", withAuth(handleUserStatus))
 	mux.HandleFunc("POST /api/users/password", withAuth(handleUserResetPwd))
+	mux.HandleFunc("GET /api/gold-price/current", withAuth(handleGoldPriceCurrent))
+	mux.HandleFunc("GET /api/gold-price/history", withAuth(handleGoldPriceHistory))
+	mux.HandleFunc("POST /api/gold-price", withAuth(handleGoldPricePublish))
 	mux.HandleFunc("GET /api/items", withAuth(handleItems))
 	mux.HandleFunc("POST /api/doc/inbound/save", withAuth(handleInboundSave))
 	mux.HandleFunc("POST /api/doc/inbound/confirm", withAuth(handleInboundConfirm))

@@ -18,11 +18,19 @@ interface Item {
   id: number
   barcode: string
   name: string
+  category?: string
   purity: string
   weightG: number
+  price?: number
   status: string
 }
 const items = ref<Item[]>([])
+const itemsTotal = ref(0)
+const itemsSumW = ref(0)
+// 库存筛选条件
+const fStatus = ref('')
+const fCategory = ref('')
+const fKeyword = ref('')
 
 // ===== 单据列表 =====
 interface Doc {
@@ -41,7 +49,49 @@ interface Line {
   name: string
   purity: string
   weightG: number | null
+  price: number | null
 }
+// ===== 金价 =====
+interface GoldPrice {
+  purity: string
+  retailPrice: number
+  recyclePrice: number
+  by: string
+  at: string
+}
+const goldPrices = ref<GoldPrice[]>([])
+const gpHistory = ref<GoldPrice[]>([])
+const showGpHistory = ref(false)
+const gpPurity = ref('足金999.9')
+const gpRetail = ref<number | null>(null)
+const gpRecycle = ref<number | null>(null)
+
+async function loadGoldPrices() {
+  const r = await api.goldPriceCurrent()
+  goldPrices.value = r.list
+}
+async function publishGoldPrice() {
+  errMsg.value = ''
+  try {
+    await api.goldPricePublish(gpPurity.value, Number(gpRetail.value) || 0, Number(gpRecycle.value) || 0)
+    flash(`已发布 ${gpPurity.value} 金价`)
+    gpRetail.value = null
+    gpRecycle.value = null
+    await loadGoldPrices()
+    if (showGpHistory.value) await loadGpHistory()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function loadGpHistory() {
+  const r = await api.goldPriceHistory()
+  gpHistory.value = r.list
+}
+async function toggleGpHistory() {
+  showGpHistory.value = !showGpHistory.value
+  if (showGpHistory.value) await loadGpHistory()
+}
+
 // ===== 退库单 =====
 interface ODoc {
   id: number
@@ -296,7 +346,7 @@ function resetForm() {
   editingId.value = 0
   editingNo.value = ''
   category.value = '黄金'
-  lines.value = [{ barcode: '', name: '', purity: '足金999.9', weightG: null }]
+  lines.value = [{ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null }]
 }
 
 function flash(ok: string) {
@@ -320,15 +370,24 @@ async function doLogin() {
 }
 
 async function refreshAll() {
-  const [ri, rd, ro] = await Promise.all([api.items(), api.inboundList(), api.outboundList()])
+  const params: Record<string, string> = {}
+  if (fStatus.value) params.status = fStatus.value
+  if (fCategory.value) params.category = fCategory.value
+  if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
+  const [ri, rd, ro] = await Promise.all([
+    api.items(params), api.inboundList(), api.outboundList(),
+  ])
   items.value = ri.list
+  itemsTotal.value = ri.total
+  itemsSumW.value = ri.sumWeightG
   docs.value = rd.list
   odocs.value = ro.list
   await loadDicts()
+  await loadGoldPrices()
 }
 
 function addLine() {
-  lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null })
+  lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null })
 }
 function removeLine(i: number) {
   lines.value.splice(i, 1)
@@ -343,6 +402,7 @@ function payload() {
       name: l.name,
       purity: l.purity,
       weightG: Number(l.weightG) || 0,
+      price: Number(l.price) || 0,
     })),
   }
 }
@@ -427,6 +487,7 @@ function editDoc(d: Doc) {
     name: it.name,
     purity: it.purity,
     weightG: it.weightG,
+    price: it.price ?? 0,
   }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -527,6 +588,45 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      <!-- 今日金价（所有人可见；管理员可发布） -->
+      <section class="card">
+        <h2>今日金价 <button class="mini" @click="toggleGpHistory">{{ showGpHistory ? '收起历史' : '调价历史' }}</button></h2>
+        <table v-if="goldPrices.length">
+          <thead><tr><th>成色</th><th>零售(元/克)</th><th>回收(元/克)</th><th>发布</th></tr></thead>
+          <tbody>
+            <tr v-for="g in goldPrices" :key="g.purity">
+              <td>{{ g.purity }}</td>
+              <td><b>{{ g.retailPrice.toFixed(2) }}</b></td>
+              <td>{{ g.recyclePrice > 0 ? g.recyclePrice.toFixed(2) : '—' }}</td>
+              <td class="hint">{{ g.by }} · {{ g.at }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="hint">今日尚未发布金价。</p>
+        <div class="row" v-if="isAdmin">
+          <label>成色
+            <select v-model="gpPurity">
+              <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
+            </select>
+          </label>
+          <label>零售价 <input v-model.number="gpRetail" type="number" step="0.01" style="width:100px" /></label>
+          <label>回收价 <input v-model.number="gpRecycle" type="number" step="0.01" style="width:100px" placeholder="可空" /></label>
+          <button @click="publishGoldPrice">发布</button>
+        </div>
+        <table v-if="showGpHistory">
+          <thead><tr><th>时间</th><th>成色</th><th>零售</th><th>回收</th><th>发布人</th></tr></thead>
+          <tbody>
+            <tr v-for="(g, i) in gpHistory" :key="i">
+              <td class="hint">{{ g.at }}</td>
+              <td>{{ g.purity }}</td>
+              <td>{{ g.retailPrice.toFixed(2) }}</td>
+              <td>{{ g.recyclePrice > 0 ? g.recyclePrice.toFixed(2) : '—' }}</td>
+              <td class="hint">{{ g.by }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
       <!-- 开单表单 -->
       <section class="card">
         <h2>
@@ -542,7 +642,7 @@ function editDoc(d: Doc) {
         </div>
         <table>
           <thead>
-            <tr><th>#</th><th>条码号(留空确认时自动生成)</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th></th></tr>
+            <tr><th>#</th><th>条码号(留空确认时自动生成)</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th>售价(¥,按克可填0)</th><th></th></tr>
           </thead>
           <tbody>
             <tr v-for="(l, i) in lines" :key="i">
@@ -555,6 +655,7 @@ function editDoc(d: Doc) {
                 </select>
               </td>
               <td><input v-model.number="l.weightG" type="number" step="0.01" /></td>
+              <td><input v-model.number="l.price" type="number" step="1" placeholder="0" /></td>
               <td><button class="mini" @click="removeLine(i)" :disabled="lines.length === 1">删行</button></td>
             </tr>
           </tbody>
@@ -664,21 +765,43 @@ function editDoc(d: Doc) {
 
       <!-- 库存 -->
       <section class="card">
-        <h2>总库库存（{{ items.length }} 件）</h2>
+        <h2>总库库存</h2>
+        <div class="row">
+          <label>状态
+            <select v-model="fStatus" @change="refreshAll">
+              <option value="">全部</option>
+              <option>在库</option>
+              <option>已退库</option>
+            </select>
+          </label>
+          <label>大类
+            <select v-model="fCategory" @change="refreshAll">
+              <option value="">全部</option>
+              <option v-for="c in dicts.category" :key="c.id" :value="c.name">{{ c.name }}</option>
+            </select>
+          </label>
+          <label>搜索 <input v-model="fKeyword" placeholder="条码前缀或名称" @keyup.enter="refreshAll" /></label>
+          <button class="mini" @click="refreshAll">查询</button>
+          <button class="mini" @click="fStatus=''; fCategory=''; fKeyword=''; refreshAll()">清空</button>
+        </div>
+        <p class="ok">共 {{ itemsTotal }} 件 · 合计克重 {{ itemsSumW.toFixed(2) }} g</p>
         <table>
           <thead>
-            <tr><th>条码号</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th>状态</th></tr>
+            <tr><th>条码号</th><th>首饰名称</th><th>大类</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>状态</th></tr>
           </thead>
           <tbody>
             <tr v-for="it in items" :key="it.id">
               <td class="mono">{{ it.barcode }}</td>
               <td>{{ it.name }}</td>
+              <td>{{ it.category }}</td>
               <td>{{ it.purity }}</td>
               <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
+              <td>{{ (it.price ?? 0) > 0 ? (it.price ?? 0).toFixed(0) : '—' }}</td>
               <td>{{ it.status }}</td>
             </tr>
           </tbody>
         </table>
+        <p class="hint" v-if="itemsTotal > items.length">仅显示最新 {{ items.length }} 条，共 {{ itemsTotal }} 条——用筛选缩小范围。</p>
       </section>
     </template>
   </main>
