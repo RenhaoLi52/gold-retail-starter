@@ -131,7 +131,7 @@ func ensureAdmin() {
 	if err != nil {
 		panic("生成密码哈希失败: " + err.Error())
 	}
-	if _, err := db.Exec(`INSERT INTO app_user (username, password, name, status) VALUES ('admin', $1, '超级管理员', 1)`, h); err != nil {
+	if _, err := db.Exec(`INSERT INTO app_user (username, password, name, status, is_admin) VALUES ('admin', $1, '超级管理员', 1, true)`, h); err != nil {
 		panic("创建默认管理员失败: " + err.Error())
 	}
 	fmt.Println("已创建默认管理员 admin / 123456 —— 请尽快登录后修改密码！")
@@ -150,7 +150,10 @@ func issueToken(uid int64, username, name string) (string, error) {
 
 type ctxKey string
 
-const ctxUID ctxKey = "uid"
+const (
+	ctxUID ctxKey = "uid"
+	ctxAdm ctxKey = "adm"
+)
 
 // currentUID 从请求上下文取当前登录用户id（withAuth 已验证并放入）
 func currentUID(r *http.Request) int64 {
@@ -158,6 +161,11 @@ func currentUID(r *http.Request) int64 {
 		return v
 	}
 	return 0
+}
+
+func currentIsAdmin(r *http.Request) bool {
+	v, _ := r.Context().Value(ctxAdm).(bool)
+	return v
 }
 
 // ===== 发号器（事务内取号，并发安全） =====
@@ -263,8 +271,17 @@ func withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, 401, "令牌无效")
 			return
 		}
-		// 把用户id放进请求上下文，后续处理函数用 currentUID(r) 取
-		next(w, r.WithContext(context.WithValue(r.Context(), ctxUID, int64(uid))))
+		// 实时校验账号状态：被禁用的账号即使令牌未过期也立即失效
+		var status int
+		var isAdmin bool
+		err = db.QueryRow(`SELECT status, is_admin FROM app_user WHERE id=$1`, int64(uid)).Scan(&status, &isAdmin)
+		if err != nil || status != 1 {
+			writeErr(w, 401, "账号已被禁用或不存在")
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxUID, int64(uid))
+		ctx = context.WithValue(ctx, ctxAdm, isAdmin)
+		next(w, r.WithContext(ctx))
 	})
 }
 
@@ -289,8 +306,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var uid int64
 	var stored, name string
-	err := db.QueryRow(`SELECT id, password, name FROM app_user WHERE username=$1 AND status=1`,
-		strings.TrimSpace(req.Username)).Scan(&uid, &stored, &name)
+	var isAdmin bool
+	err := db.QueryRow(`SELECT id, password, name, is_admin FROM app_user WHERE username=$1 AND status=1`,
+		strings.TrimSpace(req.Username)).Scan(&uid, &stored, &name, &isAdmin)
 	if err == sql.ErrNoRows || (err == nil && !verifyPassword(req.Password, stored)) {
 		// 账号不存在与密码错误返回同一句话——不给攻击者"账号是否存在"的线索
 		writeErr(w, 401, "账号或密码错误")
@@ -305,7 +323,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "签发令牌失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"token": token, "name": name})
+	writeJSON(w, 200, map[string]any{"token": token, "name": name, "isAdmin": isAdmin})
 }
 
 // POST /api/me/password —— 修改自己的密码（需先验证旧密码）
@@ -342,6 +360,168 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"ok": "密码已修改"})
+}
+
+// ===== 用户管理（仅管理员，v0.5） =====
+
+func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if !currentIsAdmin(r) {
+		writeErr(w, 403, "需要管理员权限")
+		return false
+	}
+	return true
+}
+
+// GET /api/users —— 用户列表
+func handleUserList(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	rows, err := db.Query(`SELECT id, username, name, status, is_admin,
+		to_char(created_at,'YYYY-MM-DD') FROM app_user ORDER BY id`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type U struct {
+		ID       int64  `json:"id"`
+		Username string `json:"username"`
+		Name     string `json:"name"`
+		Status   int    `json:"status"`
+		IsAdmin  bool   `json:"isAdmin"`
+		Created  string `json:"created"`
+	}
+	list := []U{}
+	for rows.Next() {
+		var u U
+		if err := rows.Scan(&u.ID, &u.Username, &u.Name, &u.Status, &u.IsAdmin, &u.Created); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, u)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// POST /api/users —— 新建用户
+func handleUserCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	req.Name = strings.TrimSpace(req.Name)
+	if len(req.Username) < 3 || len(req.Username) > 20 {
+		writeErr(w, 400, "用户名需3-20个字符")
+		return
+	}
+	for _, ch := range req.Username {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+			writeErr(w, 400, "用户名只能含字母、数字、下划线")
+			return
+		}
+	}
+	if req.Name == "" {
+		writeErr(w, 400, "姓名不能为空")
+		return
+	}
+	if len(req.Password) < 6 {
+		writeErr(w, 400, "初始密码至少6位")
+		return
+	}
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM app_user WHERE username=$1)`, req.Username).Scan(&exists); err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if exists {
+		writeErr(w, 400, "用户名已存在")
+		return
+	}
+	h, err := hashPassword(req.Password)
+	if err != nil {
+		writeErr(w, 500, "生成哈希失败: "+err.Error())
+		return
+	}
+	var id int64
+	if err := db.QueryRow(`INSERT INTO app_user (username, password, name, status, is_admin)
+		VALUES ($1,$2,$3,1,false) RETURNING id`, req.Username, h, req.Name).Scan(&id); err != nil {
+		writeErr(w, 500, "创建失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id, "username": req.Username})
+}
+
+// POST /api/users/status —— 启用/禁用（不能操作自己）
+func handleUserStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID     int64 `json:"id"`
+		Status int   `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 || (req.Status != 0 && req.Status != 1) {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if req.ID == currentUID(r) {
+		writeErr(w, 400, "不能启用/禁用自己的账号")
+		return
+	}
+	res, err := db.Exec(`UPDATE app_user SET status=$1 WHERE id=$2`, req.Status, req.ID)
+	if err != nil {
+		writeErr(w, 500, "更新失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "用户不存在")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": req.Status})
+}
+
+// POST /api/users/password —— 管理员重置任意用户密码
+func handleUserResetPwd(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID          int64  `json:"id"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		writeErr(w, 400, "新密码至少6位")
+		return
+	}
+	h, err := hashPassword(req.NewPassword)
+	if err != nil {
+		writeErr(w, 500, "生成哈希失败: "+err.Error())
+		return
+	}
+	res, err := db.Exec(`UPDATE app_user SET password=$1 WHERE id=$2`, h, req.ID)
+	if err != nil {
+		writeErr(w, 500, "更新失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "用户不存在")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"ok": "密码已重置"})
 }
 
 func handleItems(w http.ResponseWriter, r *http.Request) {
@@ -752,6 +932,10 @@ func main() {
 	mux.HandleFunc("POST /api/login", withCORS(handleLogin))
 	mux.HandleFunc("OPTIONS /api/", withCORS(func(w http.ResponseWriter, r *http.Request) {}))
 	mux.HandleFunc("POST /api/me/password", withAuth(handleChangePassword))
+	mux.HandleFunc("GET /api/users", withAuth(handleUserList))
+	mux.HandleFunc("POST /api/users", withAuth(handleUserCreate))
+	mux.HandleFunc("POST /api/users/status", withAuth(handleUserStatus))
+	mux.HandleFunc("POST /api/users/password", withAuth(handleUserResetPwd))
 	mux.HandleFunc("GET /api/items", withAuth(handleItems))
 	mux.HandleFunc("POST /api/doc/inbound/save", withAuth(handleInboundSave))
 	mux.HandleFunc("POST /api/doc/inbound/confirm", withAuth(handleInboundConfirm))

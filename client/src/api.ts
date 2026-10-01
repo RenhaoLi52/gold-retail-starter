@@ -36,4 +36,13 @@ export const api = {
   inboundList: () => request('GET', '/api/doc/inbound'),
   changePassword: (oldPassword: string, newPassword: string) =>
     request('POST', '/api/me/password', { oldPassword, newPassword }),
+
+  // 用户管理（仅管理员）
+  userList: () => request('GET', '/api/users'),
+  userCreate: (username: string, name: string, password: string) =>
+    request('POST', '/api/users', { username, name, password }),
+  userSetStatus: (id: number, status: number) =>
+    request('POST', '/api/users/status', { id, status }),
+  userResetPassword: (id: number, newPassword: string) =>
+    request('POST', '/api/users/password', { id, newPassword }),
 }

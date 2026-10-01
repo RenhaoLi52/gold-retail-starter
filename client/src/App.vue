@@ -9,6 +9,7 @@ const logged = ref(false)
 const username = ref('admin')
 const password = ref('123456')
 const userLabel = ref('')
+const isAdmin = ref(false)
 const errMsg = ref('')
 const okMsg = ref('')
 
@@ -41,6 +42,68 @@ interface Line {
   purity: string
   weightG: number | null
 }
+// ===== 用户管理（仅管理员） =====
+interface User {
+  id: number
+  username: string
+  name: string
+  status: number
+  isAdmin: boolean
+  created: string
+}
+const users = ref<User[]>([])
+const showUsers = ref(false)
+const nuUsername = ref('')
+const nuName = ref('')
+const nuPassword = ref('')
+
+async function toggleUsers() {
+  showUsers.value = !showUsers.value
+  if (showUsers.value) await loadUsers()
+}
+async function loadUsers() {
+  try {
+    const r = await api.userList()
+    users.value = r.list
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function createUser() {
+  errMsg.value = ''
+  try {
+    await api.userCreate(nuUsername.value, nuName.value, nuPassword.value)
+    flash(`已创建用户 ${nuUsername.value}`)
+    nuUsername.value = ''
+    nuName.value = ''
+    nuPassword.value = ''
+    await loadUsers()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function setUserStatus(u: User, status: number) {
+  errMsg.value = ''
+  try {
+    await api.userSetStatus(u.id, status)
+    flash(`${u.name} 已${status === 1 ? '启用' : '禁用'}`)
+    await loadUsers()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function resetUserPwd(u: User) {
+  const p = window.prompt(`为 ${u.name}(${u.username}) 设置新密码（至少6位）：`)
+  if (!p) return
+  errMsg.value = ''
+  try {
+    await api.userResetPassword(u.id, p)
+    flash(`${u.name} 的密码已重置`)
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 // ===== 修改密码 =====
 const showPwd = ref(false)
 const oldPwd = ref('')
@@ -82,6 +145,7 @@ async function doLogin() {
     const r = await api.login(username.value, password.value)
     setToken(r.token)
     userLabel.value = r.name
+    isAdmin.value = !!r.isAdmin
     logged.value = true
     await refreshAll()
   } catch (e) {
@@ -220,6 +284,7 @@ function editDoc(d: Doc) {
       <p class="hint">
         当前用户：{{ userLabel }}
         <button class="mini" @click="showPwd = !showPwd">修改密码</button>
+        <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
       </p>
       <div v-if="showPwd" class="card">
         <div class="row">
@@ -230,6 +295,36 @@ function editDoc(d: Doc) {
       </div>
       <p v-if="okMsg" class="ok">{{ okMsg }}</p>
       <p v-if="errMsg" class="err">{{ errMsg }}</p>
+
+      <!-- 用户管理（仅管理员可见） -->
+      <section v-if="isAdmin && showUsers" class="card">
+        <h2>用户管理 <button class="mini" @click="loadUsers">刷新</button></h2>
+        <table>
+          <thead>
+            <tr><th>用户名</th><th>姓名</th><th>状态</th><th>角色</th><th>创建日期</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="u in users" :key="u.id">
+              <td class="mono">{{ u.username }}</td>
+              <td>{{ u.name }}</td>
+              <td>{{ u.status === 1 ? '启用' : '已禁用' }}</td>
+              <td>{{ u.isAdmin ? '管理员' : '店员' }}</td>
+              <td>{{ u.created }}</td>
+              <td>
+                <button v-if="u.status === 1" class="mini danger" @click="setUserStatus(u, 0)">禁用</button>
+                <button v-else class="mini" @click="setUserStatus(u, 1)">启用</button>
+                <button class="mini" @click="resetUserPwd(u)">重置密码</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <label>用户名 <input v-model="nuUsername" placeholder="字母数字下划线" /></label>
+          <label>姓名 <input v-model="nuName" /></label>
+          <label>初始密码 <input v-model="nuPassword" type="password" /></label>
+          <button @click="createUser">新建用户</button>
+        </div>
+      </section>
 
       <!-- 开单表单 -->
       <section class="card">
