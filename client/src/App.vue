@@ -102,11 +102,18 @@ interface SaleLine {
   mode: string
   soldPrice: number | null
 }
+interface PayLine {
+  method: string
+  amount: number | null
+}
 interface SDoc {
   id: number
   docNo: string
   status: string
   totalAmount: number
+  salespersonId: number
+  salespersonName: string
+  payments: PayLine[]
   lines: SaleLine[]
   madeAt: string
 }
@@ -115,12 +122,33 @@ const slEditingId = ref(0)
 const slEditingNo = ref('')
 const slLines = ref<SaleLine[]>([])
 const slInput = ref('')
+const slSalespersonId = ref(0)
+const slPays = ref<PayLine[]>([])
 
 function slReset() {
   slEditingId.value = 0
   slEditingNo.value = ''
   slLines.value = []
   slInput.value = ''
+  slSalespersonId.value = 0
+  slPays.value = []
+}
+
+// ===== 组合收款（v0.14） =====
+function slAddPay() {
+  // 默认选第一个还没用过的方式
+  const used = new Set(slPays.value.map(p => p.method))
+  const next = enabledPayMethods().find(m => !used.has(m.name))
+  slPays.value.push({ method: next?.name ?? '', amount: null })
+}
+function slRemovePay(i: number) {
+  slPays.value.splice(i, 1)
+}
+const slPayTotal = () => slPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
+// 补足：把这一笔金额填成"应收 - 其他各笔合计"（顾客现金+微信各付一部分时特别省事）
+function slFillPay(p: PayLine) {
+  const others = slPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
+  p.amount = Math.round((slTotal() - others) * 100) / 100
 }
 function goldRateOf(purity: string): number {
   return goldPrices.value.find(g => g.purity === purity)?.retailPrice ?? 0
@@ -174,6 +202,11 @@ async function slSave(confirmAfter: boolean) {
   try {
     const r = await api.saleSave({
       id: slEditingId.value,
+      salespersonId: slSalespersonId.value,
+      // 完全空白的收款行（没选方式）不上传；选了方式的原样上传让服务端把关
+      payments: slPays.value
+        .filter(p => p.method)
+        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
       lines: slLines.value.map(l => ({
         barcode: l.barcode, mode: l.mode, soldPrice: Number(l.soldPrice) || 0,
       })),
@@ -234,6 +267,8 @@ function slEdit(d: SDoc) {
   slEditingId.value = d.id
   slEditingNo.value = d.docNo
   slLines.value = d.lines.map(l => ({ ...l }))
+  slSalespersonId.value = d.salespersonId || 0
+  slPays.value = (d.payments ?? []).map(p => ({ ...p }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -360,22 +395,74 @@ interface DictItem {
   sort: number
   enabled: boolean
 }
-const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [] })
-const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别' }
+const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [], pay_method: [] })
+const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别', pay_method: '收款方式' }
 const dictTab = ref('category')
 const showDicts = ref(false)
 const ndName = ref('')
 const ndSort = ref(0)
 
 async function loadDicts() {
-  const [c, pu, j] = await Promise.all([
-    api.dictList('category'), api.dictList('purity'), api.dictList('jewel_type'),
+  const [c, pu, j, pm] = await Promise.all([
+    api.dictList('category'), api.dictList('purity'), api.dictList('jewel_type'), api.dictList('pay_method'),
   ])
-  dicts.value = { category: c.list, purity: pu.list, jewel_type: j.list }
+  dicts.value = { category: c.list, purity: pu.list, jewel_type: j.list, pay_method: pm.list }
 }
 // 开单下拉只用启用项
 const enabledCats = () => dicts.value.category.filter(d => d.enabled)
 const enabledPurities = () => dicts.value.purity.filter(d => d.enabled)
+const enabledPayMethods = () => dicts.value.pay_method.filter(d => d.enabled)
+
+// ===== 售货员档案（v0.14） =====
+interface Salesperson {
+  id: number
+  name: string
+  sort: number
+  enabled: boolean
+}
+const salespersons = ref<Salesperson[]>([])
+const showSps = ref(false)
+const nspName = ref('')
+const nspSort = ref(0)
+
+async function loadSalespersons() {
+  const r = await api.salespersonList()
+  salespersons.value = r.list
+}
+const enabledSalespersons = () => salespersons.value.filter(s => s.enabled)
+
+async function createSp() {
+  errMsg.value = ''
+  try {
+    await api.salespersonCreate(nspName.value, Number(nspSort.value) || 0)
+    flash(`已新增售货员：${nspName.value}`)
+    nspName.value = ''
+    await loadSalespersons()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function toggleSp(s: Salesperson) {
+  errMsg.value = ''
+  try {
+    await api.salespersonUpdate({ id: s.id, enabled: !s.enabled })
+    flash(`${s.name} 已${s.enabled ? '停用' : '启用'}`)
+    await loadSalespersons()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function saveSp(s: Salesperson) {
+  errMsg.value = ''
+  try {
+    await api.salespersonUpdate({ id: s.id, name: s.name, sort: Number(s.sort) || 0 })
+    flash(`售货员资料已保存：${s.name}`)
+    await loadSalespersons()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await loadSalespersons() // 失败时还原回服务端数据
+  }
+}
 
 async function createDict() {
   errMsg.value = ''
@@ -553,6 +640,7 @@ async function refreshAll() {
   sdocs.value = rs.list
   await loadDicts()
   await loadGoldPrices()
+  await loadSalespersons()
 }
 
 function addLine() {
@@ -684,6 +772,7 @@ function editDoc(d: Doc) {
         <button class="mini" @click="showPwd = !showPwd">修改密码</button>
         <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
         <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
+        <button v-if="isAdmin" class="mini" @click="showSps = !showSps">售货员</button>
         <button class="mini" @click="doLogout">退出登录</button>
       </p>
       <div v-if="showPwd" class="card">
@@ -726,6 +815,35 @@ function editDoc(d: Doc) {
           <button @click="createDict">新增{{ dictLabels[dictTab] }}</button>
         </div>
         <p class="hint">字典只停用不删除——历史单据和货品引用着这些名字。改名也暂不开放，避免历史数据失去解释。</p>
+      </section>
+
+      <!-- 售货员维护（仅管理员可见，v0.14） -->
+      <section v-if="isAdmin && showSps" class="card">
+        <h2>售货员维护</h2>
+        <table>
+          <thead>
+            <tr><th>姓名</th><th>排序</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in salespersons" :key="s.id">
+              <td><input v-model="s.name" style="width:120px" /></td>
+              <td><input v-model.number="s.sort" type="number" style="width:60px" /></td>
+              <td>{{ s.enabled ? '在职' : '已停用' }}</td>
+              <td>
+                <button class="mini" @click="saveSp(s)">保存</button>
+                <button :class="['mini', s.enabled ? 'danger' : '']" @click="toggleSp(s)">
+                  {{ s.enabled ? '停用' : '启用' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row">
+          <label>姓名 <input v-model="nspName" /></label>
+          <label>排序 <input v-model.number="nspSort" type="number" style="width:70px" /></label>
+          <button @click="createSp">新增售货员</button>
+        </div>
+        <p class="hint">售货员是销售档案，与登录账号是两回事。单据按编号引用售货员，所以改名是安全的（这点与字典相反）。离职只停用不删除。</p>
       </section>
 
       <!-- 用户管理（仅管理员可见） -->
@@ -831,6 +949,35 @@ function editDoc(d: Doc) {
             </tr>
           </tbody>
         </table>
+        <!-- 售货员 + 组合收款（v0.14） -->
+        <div class="row" v-if="slLines.length">
+          <label>售货员
+            <select v-model.number="slSalespersonId">
+              <option :value="0">— 请选择 —</option>
+              <option v-for="s in enabledSalespersons()" :key="s.id" :value="s.id">{{ s.name }}</option>
+            </select>
+          </label>
+        </div>
+        <template v-if="slLines.length">
+          <div class="row" v-for="(p, i) in slPays" :key="i">
+            <label>收款方式
+              <select v-model="p.method">
+                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
+              </select>
+            </label>
+            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
+            <button class="mini" @click="slFillPay(p)">补足</button>
+            <button class="mini danger" @click="slRemovePay(i)">移除</button>
+          </div>
+          <div class="row">
+            <button class="mini" @click="slAddPay">+ 添加收款方式</button>
+            <span class="hint" v-if="slPays.length">
+              已收 ¥{{ slPayTotal().toFixed(2) }} / 应收 ¥{{ slTotal().toFixed(2) }}
+              <b v-if="Math.abs(slPayTotal() - slTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (slTotal() - slPayTotal()).toFixed(2) }}）</b>
+              <b v-else style="color:#2f7d4f">✓ 两讫</b>
+            </span>
+          </div>
+        </template>
         <div class="row" v-if="slLines.length">
           <p class="ok" style="margin:0">合计：¥{{ slTotal().toFixed(2) }}</p>
           <span class="spacer"></span>
@@ -848,6 +995,10 @@ function editDoc(d: Doc) {
             <span class="mono">{{ d.docNo }}</span>
             <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
             <span class="ok" v-if="d.totalAmount > 0">¥{{ d.totalAmount.toFixed(2) }}</span>
+            <span v-if="d.salespersonName">售货员：{{ d.salespersonName }}</span>
+            <span class="hint" v-if="d.payments?.length">
+              {{ d.payments.map(p => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
+            </span>
             <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
             <span class="spacer"></span>
             <template v-if="d.status === '草稿'">

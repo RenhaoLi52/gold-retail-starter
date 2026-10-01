@@ -96,6 +96,12 @@ export const api = {
   dictCreate: (payload: unknown) => request('POST', '/api/dict', payload),
   dictUpdate: (payload: unknown) => request('POST', '/api/dict/update', payload),
 
+  // 售货员档案（读取所有人；增改仅管理员）
+  salespersonList: () => request('GET', '/api/salespersons'),
+  salespersonCreate: (name: string, sort: number) =>
+    request('POST', '/api/salespersons', { name, sort }),
+  salespersonUpdate: (payload: unknown) => request('POST', '/api/salespersons/update', payload),
+
   // 用户管理（仅管理员）
   userList: () => request('GET', '/api/users'),
   userCreate: (username: string, name: string, password: string) =>

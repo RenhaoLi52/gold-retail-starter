@@ -547,7 +547,7 @@ func handleUserResetPwd(w http.ResponseWriter, r *http.Request) {
 // 三个字典（大类/成色/类别）共用一张表、一套接口——与单据引擎同源的复用思想。
 // 读取：所有登录用户；新增/修改：仅管理员。只停用不删除。
 
-var validDictTypes = map[string]bool{"category": true, "purity": true, "jewel_type": true}
+var validDictTypes = map[string]bool{"category": true, "purity": true, "jewel_type": true, "pay_method": true}
 
 // GET /api/dict?type=category —— 读取某字典（含停用项，前端下拉自行过滤 enabled）
 func handleDictList(w http.ResponseWriter, r *http.Request) {
@@ -640,6 +640,113 @@ func handleDictUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Enabled != nil {
 		if _, err := db.Exec(`UPDATE dict_item SET enabled=$1 WHERE id=$2`, *req.Enabled, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID})
+}
+
+// ===== 售货员档案（v0.14） =====
+// 独立表而非字典：以后要挂提成比例/工号/门店等字段。
+// 单据按 id 引用（非名字）——所以改名安全，这点与字典相反。
+
+// GET /api/salespersons —— 所有登录用户可读（开单下拉要用；前端自行过滤 enabled）
+func handleSalespersonList(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT id, name, sort, enabled FROM salesperson ORDER BY sort, id`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type S struct {
+		ID      int64  `json:"id"`
+		Name    string `json:"name"`
+		Sort    int    `json:"sort"`
+		Enabled bool   `json:"enabled"`
+	}
+	list := []S{}
+	for rows.Next() {
+		var s S
+		if err := rows.Scan(&s.ID, &s.Name, &s.Sort, &s.Enabled); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		list = append(list, s)
+	}
+	writeJSON(w, 200, map[string]any{"list": list})
+}
+
+// POST /api/salespersons —— 新增（管理员）
+func handleSalespersonCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Sort int    `json:"sort"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "参数格式错误")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len([]rune(req.Name)) > 20 {
+		writeErr(w, 400, "姓名不能为空且不超过20字")
+		return
+	}
+	var id int64
+	err := db.QueryRow(`INSERT INTO salesperson (name, sort) VALUES ($1,$2) RETURNING id`,
+		req.Name, req.Sort).Scan(&id)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") {
+			writeErr(w, 400, "该姓名已存在")
+			return
+		}
+		writeErr(w, 500, "创建失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+// POST /api/salespersons/update —— 改名/排序/停用启用（管理员）
+func handleSalespersonUpdate(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		ID      int64   `json:"id"`
+		Name    *string `json:"name"`
+		Sort    *int    `json:"sort"`
+		Enabled *bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if req.Name != nil {
+		n := strings.TrimSpace(*req.Name)
+		if n == "" || len([]rune(n)) > 20 {
+			writeErr(w, 400, "姓名不能为空且不超过20字")
+			return
+		}
+		if _, err := db.Exec(`UPDATE salesperson SET name=$1 WHERE id=$2`, n, req.ID); err != nil {
+			if strings.Contains(err.Error(), "duplicate key") {
+				writeErr(w, 400, "该姓名已存在")
+				return
+			}
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	if req.Sort != nil {
+		if _, err := db.Exec(`UPDATE salesperson SET sort=$1 WHERE id=$2`, *req.Sort, req.ID); err != nil {
+			writeErr(w, 500, "更新失败: "+err.Error())
+			return
+		}
+	}
+	if req.Enabled != nil {
+		if _, err := db.Exec(`UPDATE salesperson SET enabled=$1 WHERE id=$2`, *req.Enabled, req.ID); err != nil {
 			writeErr(w, 500, "更新失败: "+err.Error())
 			return
 		}
@@ -1094,11 +1201,37 @@ func currentGoldPrice(purity string) (float64, bool, error) {
 	return rate, err == nil, err
 }
 
-// POST /api/doc/sale/save  {id?, lines:[{barcode,mode,soldPrice}]}
+// PayLine 一笔收款：方式+金额。组合收款 = 多笔，确认时校验合计=应收。
+type PayLine struct {
+	Method string  `json:"method"`
+	Amount float64 `json:"amount"`
+}
+
+// 收款明细的通用校验（草稿与确认共用）：方式不重复、金额>0
+func validatePayments(pays []PayLine) error {
+	seen := map[string]bool{}
+	for i, p := range pays {
+		if strings.TrimSpace(p.Method) == "" {
+			return fmt.Errorf("第%d笔收款未选方式", i+1)
+		}
+		if seen[p.Method] {
+			return fmt.Errorf("收款方式「%s」重复——同一方式请合并成一笔", p.Method)
+		}
+		seen[p.Method] = true
+		if p.Amount <= 0 {
+			return fmt.Errorf("收款「%s」金额必须大于0", p.Method)
+		}
+	}
+	return nil
+}
+
+// POST /api/doc/sale/save  {id?, salespersonId?, payments?, lines:[{barcode,mode,soldPrice}]}
 func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID    int64 `json:"id"`
-		Lines []struct {
+		ID            int64     `json:"id"`
+		SalespersonID int64     `json:"salespersonId"`
+		Payments      []PayLine `json:"payments"`
+		Lines         []struct {
 			Barcode   string  `json:"barcode"`
 			Mode      string  `json:"mode"`
 			SoldPrice float64 `json:"soldPrice"`
@@ -1106,6 +1239,12 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Lines) == 0 {
 		writeErr(w, 400, "参数错误：至少要有一行")
+		return
+	}
+	// 草稿阶段的宽松校验：售货员/收款可以先不填（挂单常在收款前），
+	// 但填了就不能是明显错的。收款合计=应收 的硬校验放在确认时。
+	if err := validatePayments(req.Payments); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	seen := map[string]bool{}
@@ -1165,6 +1304,15 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		lines = append(lines, sl)
 	}
 	linesJSON, _ := json.Marshal(lines)
+	if req.Payments == nil {
+		req.Payments = []PayLine{}
+	}
+	paysJSON, _ := json.Marshal(req.Payments)
+	// salesperson_id 可空：0 表示未选，存 NULL（外键列不能存0——没有id为0的售货员）
+	var spID any
+	if req.SalespersonID > 0 {
+		spID = req.SalespersonID
+	}
 
 	if req.ID == 0 {
 		tx, err := db.Begin()
@@ -1185,8 +1333,8 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		}
 		docNo := fmt.Sprintf("XS%s%02d", today, seq)
 		var docID int64
-		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines)
-			VALUES ($1,'sale','草稿',$2,$3) RETURNING id`, docNo, currentUID(r), linesJSON).Scan(&docID)
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines, salesperson_id, payments)
+			VALUES ($1,'sale','草稿',$2,$3,$4,$5) RETURNING id`, docNo, currentUID(r), linesJSON, spID, paysJSON).Scan(&docID)
 		if err != nil {
 			writeErr(w, 500, "保存失败: "+err.Error())
 			return
@@ -1198,8 +1346,8 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
 		return
 	}
-	res, err := db.Exec(`UPDATE doc SET draft_lines=$1
-		WHERE id=$2 AND doc_type='sale' AND status='草稿'`, linesJSON, req.ID)
+	res, err := db.Exec(`UPDATE doc SET draft_lines=$1, salesperson_id=$2, payments=$3
+		WHERE id=$4 AND doc_type='sale' AND status='草稿'`, linesJSON, spID, paysJSON, req.ID)
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
@@ -1237,8 +1385,10 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
 		return
 	}
-	var linesJSON []byte
-	if err := tx.QueryRow(`SELECT draft_lines FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON); err != nil {
+	var linesJSON, paysJSON []byte
+	var spID sql.NullInt64
+	if err := tx.QueryRow(`SELECT draft_lines, salesperson_id, payments FROM doc WHERE id=$1`,
+		req.ID).Scan(&linesJSON, &spID, &paysJSON); err != nil {
 		writeErr(w, 500, "读取单据失败: "+err.Error())
 		return
 	}
@@ -1246,6 +1396,41 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(linesJSON, &lines); err != nil || len(lines) == 0 {
 		writeErr(w, 400, "草稿明细为空，无法确认")
 		return
+	}
+
+	// 确认时硬校验一：售货员必填且在职启用（v0.14）
+	if !spID.Valid {
+		writeErr(w, 400, "请先选择售货员再确认收款")
+		return
+	}
+	var spEnabled bool
+	if err := tx.QueryRow(`SELECT enabled FROM salesperson WHERE id=$1`, spID.Int64).Scan(&spEnabled); err != nil {
+		writeErr(w, 400, "售货员不存在，请重新选择")
+		return
+	}
+	if !spEnabled {
+		writeErr(w, 400, "该售货员已停用，请重新选择")
+		return
+	}
+	// 确认时硬校验二：收款明细合法，且每种方式都是启用的字典项
+	var pays []PayLine
+	_ = json.Unmarshal(paysJSON, &pays)
+	if len(pays) == 0 {
+		writeErr(w, 400, "请先录入收款方式再确认收款")
+		return
+	}
+	if err := validatePayments(pays); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	for _, p := range pays {
+		var en bool
+		err := tx.QueryRow(`SELECT enabled FROM dict_item WHERE dict_type='pay_method' AND name=$1`,
+			p.Method).Scan(&en)
+		if err != nil || !en {
+			writeErr(w, 400, fmt.Sprintf("收款方式「%s」不存在或已停用", p.Method))
+			return
+		}
 	}
 
 	rates := map[string]float64{} // 本单用到的各成色确认时金价
@@ -1313,6 +1498,16 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 确认时硬校验三：收款合计必须分毫不差等于应收合计
+	var paySum float64
+	for _, p := range pays {
+		paySum += p.Amount
+	}
+	if round2(paySum) != round2(total) {
+		writeErr(w, 400, fmt.Sprintf("收款合计 ¥%.2f 与应收合计 ¥%.2f 不一致，整单未确认", paySum, total))
+		return
+	}
+
 	snapshot, _ := json.Marshal(map[string]any{"rates": rates, "lines": snaps})
 	if _, err = tx.Exec(`UPDATE doc SET total_amount=$1, gold_price_snapshot=$2 WHERE id=$3`,
 		round2(total), snapshot, req.ID); err != nil {
@@ -1439,32 +1634,42 @@ func handleSaleDelete(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/doc/sale —— 销售单列表
 func handleSaleList(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(`SELECT id, doc_no, status, draft_lines, total_amount,
-		to_char(created_at,'YYYY-MM-DD HH24:MI:SS')
-		FROM doc WHERE doc_type='sale' ORDER BY id DESC LIMIT 20`)
+	rows, err := db.Query(`SELECT d.id, d.doc_no, d.status, d.draft_lines, d.total_amount,
+		d.salesperson_id, COALESCE(sp.name,''), d.payments,
+		to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc d LEFT JOIN salesperson sp ON sp.id = d.salesperson_id
+		WHERE d.doc_type='sale' ORDER BY d.id DESC LIMIT 20`)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
 	}
 	defer rows.Close()
 	type SDoc struct {
-		ID          int64      `json:"id"`
-		DocNo       string     `json:"docNo"`
-		Status      string     `json:"status"`
-		TotalAmount float64    `json:"totalAmount"`
-		Lines       []SaleLine `json:"lines"`
-		MadeAt      string     `json:"madeAt"`
+		ID              int64      `json:"id"`
+		DocNo           string     `json:"docNo"`
+		Status          string     `json:"status"`
+		TotalAmount     float64    `json:"totalAmount"`
+		SalespersonID   int64      `json:"salespersonId"`
+		SalespersonName string     `json:"salespersonName"`
+		Payments        []PayLine  `json:"payments"`
+		Lines           []SaleLine `json:"lines"`
+		MadeAt          string     `json:"madeAt"`
 	}
 	docs := []SDoc{}
 	for rows.Next() {
 		var d SDoc
-		var dl []byte
-		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &d.TotalAmount, &d.MadeAt); err != nil {
+		var dl, pj []byte
+		var spid sql.NullInt64
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &d.TotalAmount,
+			&spid, &d.SalespersonName, &pj, &d.MadeAt); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
+		d.SalespersonID = spid.Int64
 		d.Lines = []SaleLine{}
 		_ = json.Unmarshal(dl, &d.Lines)
+		d.Payments = []PayLine{}
+		_ = json.Unmarshal(pj, &d.Payments)
 		docs = append(docs, d)
 	}
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
@@ -1920,6 +2125,9 @@ func main() {
 	mux.HandleFunc("GET /api/dict", withAuth(handleDictList))
 	mux.HandleFunc("POST /api/dict", withAuth(handleDictCreate))
 	mux.HandleFunc("POST /api/dict/update", withAuth(handleDictUpdate))
+	mux.HandleFunc("GET /api/salespersons", withAuth(handleSalespersonList))
+	mux.HandleFunc("POST /api/salespersons", withAuth(handleSalespersonCreate))
+	mux.HandleFunc("POST /api/salespersons/update", withAuth(handleSalespersonUpdate))
 	mux.HandleFunc("GET /api/users", withAuth(handleUserList))
 	mux.HandleFunc("POST /api/users", withAuth(handleUserCreate))
 	mux.HandleFunc("POST /api/users/status", withAuth(handleUserStatus))
