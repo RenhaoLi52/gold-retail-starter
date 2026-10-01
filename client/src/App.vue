@@ -274,6 +274,144 @@ function slEdit(d: SDoc) {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
+// ===== 销退单（v0.17） =====
+interface SRLine {
+  barcode: string
+  name: string
+  purity: string
+  weightG: number
+  origDocId: number
+  origDocNo: string
+  soldPrice: number
+  refundPrice: number | null
+}
+interface RDoc {
+  id: number
+  docNo: string
+  status: string
+  totalAmount: number
+  payments: PayLine[]
+  lines: SRLine[]
+  madeAt: string
+}
+const srdocs = ref<RDoc[]>([])
+const srEditingId = ref(0)
+const srEditingNo = ref('')
+const srLines = ref<SRLine[]>([])
+const srInput = ref('')
+const srPays = ref<PayLine[]>([])
+
+function srReset() {
+  srEditingId.value = 0
+  srEditingNo.value = ''
+  srLines.value = []
+  srInput.value = ''
+  srPays.value = []
+}
+async function srAdd() {
+  const bc = srInput.value.trim().toUpperCase()
+  if (!bc) return
+  if (srLines.value.some(x => x.barcode === bc)) {
+    errMsg.value = `条码 ${bc} 已在本单中`
+    return
+  }
+  try {
+    const r = await api.saleReturnLookup(bc)
+    srLines.value.push({ ...r })
+    srInput.value = ''
+    errMsg.value = ''
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function srRemove(i: number) {
+  srLines.value.splice(i, 1)
+}
+const srTotal = () => srLines.value.reduce((s2, l) => s2 + (Number(l.refundPrice) || 0), 0)
+const srPayTotal = () => srPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
+function srAddPay() {
+  const used = new Set(srPays.value.map(p => p.method))
+  const next = enabledPayMethods().find(m => !used.has(m.name))
+  srPays.value.push({ method: next?.name ?? '', amount: null })
+}
+function srRemovePay(i: number) {
+  srPays.value.splice(i, 1)
+}
+function srFillPay(p: PayLine) {
+  const others = srPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
+  p.amount = Math.round((srTotal() - others) * 100) / 100
+}
+async function srSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.saleReturnSave({
+      id: srEditingId.value,
+      payments: srPays.value.filter(p => p.method)
+        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
+      lines: srLines.value.map(l => ({
+        barcode: l.barcode, refundPrice: Number(l.refundPrice) || 0,
+      })),
+    })
+    const id = srEditingId.value || r.id
+    if (!srEditingId.value) {
+      srEditingId.value = r.id
+      srEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      const c = await api.saleReturnConfirm(id)
+      flash(`销退已确认：${srEditingNo.value}，退款合计 ¥${c.totalAmount}`)
+      srReset()
+    } else {
+      flash(`销退草稿已保存：${srEditingNo.value}`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function srConfirmDoc(d: RDoc) {
+  errMsg.value = ''
+  try {
+    const c = await api.saleReturnConfirm(d.id)
+    flash(`销退已确认：${d.docNo}，退款合计 ¥${c.totalAmount}`)
+    if (srEditingId.value === d.id) srReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function srUnconfirmDoc(d: RDoc) {
+  errMsg.value = ''
+  try {
+    await api.saleReturnUnconfirm(d.id)
+    flash(`销退已反确认：${d.docNo}`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function srDeleteDoc(d: RDoc) {
+  errMsg.value = ''
+  try {
+    await api.saleReturnDelete(d.id)
+    flash(`销退草稿 ${d.docNo} 已删除，货品回到"已售"`)
+    if (srEditingId.value === d.id) srReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function srEdit(d: RDoc) {
+  srEditingId.value = d.id
+  srEditingNo.value = d.docNo
+  srLines.value = d.lines.map(l => ({ ...l }))
+  srPays.value = (d.payments ?? []).map(p => ({ ...p }))
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
 // ===== 退库单 =====
 interface ODoc {
   id: number
@@ -633,8 +771,8 @@ async function refreshAll() {
   if (fStatus.value) params.status = fStatus.value
   if (fCategory.value) params.category = fCategory.value
   if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
-  const [ri, rd, ro, rs] = await Promise.all([
-    api.items(params), api.inboundList(), api.outboundList(), api.saleList(),
+  const [ri, rd, ro, rs, rr] = await Promise.all([
+    api.items(params), api.inboundList(), api.outboundList(), api.saleList(), api.saleReturnList(),
   ])
   items.value = ri.list
   itemsTotal.value = ri.total
@@ -642,6 +780,7 @@ async function refreshAll() {
   docs.value = rd.list
   odocs.value = ro.list
   sdocs.value = rs.list
+  srdocs.value = rr.list
   await loadDicts()
   await loadGoldPrices()
   await loadSalespersons()
@@ -1027,6 +1166,95 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      <!-- 销退单（v0.17） -->
+      <section class="card">
+        <h2>
+          {{ srEditingId ? `编辑销退草稿 ${srEditingNo}` : '销退单（退货）' }}
+          <button v-if="srEditingId" class="mini" @click="srReset">放弃，新建</button>
+        </h2>
+        <div class="row">
+          <label>条码 <input v-model="srInput" placeholder="扫已售件的条码后回车" @keyup.enter="srAdd" class="mono" /></label>
+          <button class="mini" @click="srAdd">添加</button>
+        </div>
+        <table v-if="srLines.length">
+          <thead>
+            <tr><th>条码</th><th>名称</th><th>原销售单</th><th>原成交价</th><th>退款金额(可下调)</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(l, i) in srLines" :key="l.barcode">
+              <td class="mono">{{ l.barcode }}</td>
+              <td>{{ l.name }}</td>
+              <td class="mono">{{ l.origDocNo }}</td>
+              <td>¥{{ (l.soldPrice ?? 0).toFixed(2) }}</td>
+              <td><input v-model.number="l.refundPrice" type="number" step="0.01" style="width:110px" /></td>
+              <td><button class="mini" @click="srRemove(i)">删行</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <template v-if="srLines.length">
+          <div class="row" v-for="(p, i) in srPays" :key="i">
+            <label>退款方式
+              <select v-model="p.method">
+                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
+              </select>
+            </label>
+            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
+            <button class="mini" @click="srFillPay(p)">补足</button>
+            <button class="mini danger" @click="srRemovePay(i)">移除</button>
+          </div>
+          <div class="row">
+            <button class="mini" @click="srAddPay">+ 添加退款方式</button>
+            <span class="hint" v-if="srPays.length">
+              已退 ¥{{ srPayTotal().toFixed(2) }} / 应退 ¥{{ srTotal().toFixed(2) }}
+              <b v-if="Math.abs(srPayTotal() - srTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (srTotal() - srPayTotal()).toFixed(2) }}）</b>
+              <b v-else style="color:#2f7d4f">✓ 两讫</b>
+            </span>
+          </div>
+          <div class="row">
+            <p class="ok" style="margin:0">应退合计：¥{{ srTotal().toFixed(2) }}</p>
+            <span class="spacer"></span>
+            <button class="gray" @click="srSave(false)">保存草稿</button>
+            <button @click="srSave(true)">确认退款</button>
+          </div>
+        </template>
+        <p class="hint">只收"已售"的件；退款不能超过原成交价；反确认限当日。</p>
+      </section>
+
+      <!-- 销退单列表 -->
+      <section class="card" v-if="srdocs.length">
+        <h2>销退单列表（{{ srdocs.length }} 张）</h2>
+        <div v-for="d in srdocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span class="ok" v-if="d.totalAmount > 0">退 ¥{{ d.totalAmount.toFixed(2) }}</span>
+            <span class="hint" v-if="d.payments?.length">
+              {{ d.payments.map(p => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
+            </span>
+            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="srEdit(d)">取单</button>
+              <button class="mini" @click="srConfirmDoc(d)">确认退款</button>
+              <button class="mini danger" @click="srDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini danger" @click="srUnconfirmDoc(d)">反确认(限当日)</button>
+            </template>
+          </div>
+          <table v-if="d.lines?.length">
+            <tbody>
+              <tr v-for="(l, j) in d.lines" :key="j">
+                <td class="mono" style="width:150px">{{ l.barcode }}</td>
+                <td>{{ l.name }}</td>
+                <td class="mono" style="width:150px">原单 {{ l.origDocNo }}</td>
+                <td style="width:110px">退 ¥{{ Number(l.refundPrice ?? 0).toFixed(2) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <!-- 开单表单 -->
       <section class="card">
         <h2>
@@ -1173,6 +1401,7 @@ function editDoc(d: Doc) {
               <option>在库</option>
               <option>销售中</option>
               <option>退库中</option>
+              <option>退货中</option>
               <option>已售</option>
               <option>已退库</option>
             </select>

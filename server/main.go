@@ -1812,6 +1812,504 @@ func handleSaleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
 }
 
+// ===== 销退单（v0.17）—— 跨日退货的正规出口 =====
+// 业务：只收"已售"的件；自动带出原销售单与原成交价；退款默认原价、可下调（扣损耗）
+// 但不得超过原成交价；退款走组合退款方式（与收款同一套字典与校验）。
+// 件状态：已售 →(挂草稿)→ 退货中 →(确认)→ 在库；反确认 在库→退货中，限当日。
+
+// SRLine 销退明细：原单信息在挂草稿时查定、存进草稿——确认时不再追溯
+type SRLine struct {
+	Barcode     string  `json:"barcode"`
+	Name        string  `json:"name"`
+	Purity      string  `json:"purity"`
+	WeightG     float64 `json:"weightG"`
+	OrigDocID   int64   `json:"origDocId"`
+	OrigDocNo   string  `json:"origDocNo"`
+	SoldPrice   float64 `json:"soldPrice"`   // 原实际成交价（从原单快照取）
+	RefundPrice float64 `json:"refundPrice"` // 本次退款金额
+}
+
+// rowQuerier 让同一个查询函数既能用 db 也能用 tx
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// findOrigSale 找到卖出该条码的最近一张已确认销售单，并从金价快照里取出当时的实售价
+func findOrigSale(q rowQuerier, barcode string) (docID int64, docNo string, soldPrice float64, err error) {
+	var snap []byte
+	err = q.QueryRow(`SELECT d.id, d.doc_no, d.gold_price_snapshot
+		FROM doc d
+		JOIN doc_line dl ON dl.doc_id = d.id
+		JOIN item it ON it.id = dl.item_id
+		WHERE it.barcode=$1 AND d.doc_type='sale' AND d.status='已确认'
+		ORDER BY d.id DESC LIMIT 1`, barcode).Scan(&docID, &docNo, &snap)
+	if err != nil {
+		return 0, "", 0, err
+	}
+	var s struct {
+		Lines []struct {
+			Barcode   string  `json:"barcode"`
+			SoldPrice float64 `json:"soldPrice"`
+		} `json:"lines"`
+	}
+	_ = json.Unmarshal(snap, &s)
+	for _, l := range s.Lines {
+		if l.Barcode == barcode {
+			return docID, docNo, l.SoldPrice, nil
+		}
+	}
+	return docID, docNo, 0, nil
+}
+
+// GET /api/sale-return/lookup?barcode=XXX —— 开销退单扫码时带出原单信息
+func handleSaleReturnLookup(w http.ResponseWriter, r *http.Request) {
+	bc := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("barcode")))
+	if !validBarcode(bc) {
+		writeErr(w, 400, "条码格式非法")
+		return
+	}
+	var sl SRLine
+	var status string
+	err := db.QueryRow(`SELECT name, purity, weight_g, status FROM item WHERE barcode=$1`, bc).
+		Scan(&sl.Name, &sl.Purity, &sl.WeightG, &status)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", bc))
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if status != "已售" {
+		writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」——只有已售的件才能销退", bc, status))
+		return
+	}
+	docID, docNo, soldPrice, err := findOrigSale(db, bc)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, fmt.Sprintf("条码 %s 找不到对应的已确认销售单", bc))
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "原单查询失败: "+err.Error())
+		return
+	}
+	sl.Barcode, sl.OrigDocID, sl.OrigDocNo, sl.SoldPrice, sl.RefundPrice = bc, docID, docNo, soldPrice, soldPrice
+	writeJSON(w, 200, sl)
+}
+
+// POST /api/doc/sale-return/save  {id?, payments?, lines:[{barcode,refundPrice}]}
+func handleSaleReturnSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       int64     `json:"id"`
+		Payments []PayLine `json:"payments"`
+		Lines    []struct {
+			Barcode     string  `json:"barcode"`
+			RefundPrice float64 `json:"refundPrice"`
+		} `json:"lines"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Lines) == 0 {
+		writeErr(w, 400, "参数错误：至少要有一行")
+		return
+	}
+	if err := validatePayments(req.Payments); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	seen := map[string]bool{}
+	lines := []SRLine{}
+	for i, l := range req.Lines {
+		bc := strings.ToUpper(strings.TrimSpace(l.Barcode))
+		if !validBarcode(bc) {
+			writeErr(w, 400, fmt.Sprintf("第%d行条码 %s 格式非法", i+1, bc))
+			return
+		}
+		if seen[bc] {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 重复", bc))
+			return
+		}
+		seen[bc] = true
+		if l.RefundPrice <= 0 {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 退款金额必须大于0", bc))
+			return
+		}
+		lines = append(lines, SRLine{Barcode: bc, RefundPrice: l.RefundPrice})
+	}
+	if req.Payments == nil {
+		req.Payments = []PayLine{}
+	}
+	paysJSON, _ := json.Marshal(req.Payments)
+
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	if req.ID != 0 {
+		var old []byte
+		err := tx.QueryRow(`SELECT draft_lines FROM doc
+			WHERE id=$1 AND doc_type='sale_return' AND status='草稿' FOR UPDATE`, req.ID).Scan(&old)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, "该单据不是草稿状态（可能已被确认或删除），请刷新")
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "读取单据失败: "+err.Error())
+			return
+		}
+		var oldLines []SRLine
+		_ = json.Unmarshal(old, &oldLines)
+		for _, ol := range oldLines {
+			if _, err := tx.Exec(`UPDATE item SET status='已售', version=version+1
+				WHERE barcode=$1 AND status='退货中'`, ol.Barcode); err != nil {
+				writeErr(w, 500, "解锁货品失败: "+err.Error())
+				return
+			}
+		}
+	}
+
+	for i := range lines {
+		sl := &lines[i]
+		err := tx.QueryRow(`SELECT name, purity, weight_g FROM item WHERE barcode=$1`, sl.Barcode).
+			Scan(&sl.Name, &sl.Purity, &sl.WeightG)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", sl.Barcode))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "查询失败: "+err.Error())
+			return
+		}
+		docID, docNo, soldPrice, err := findOrigSale(tx, sl.Barcode)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 找不到对应的已确认销售单", sl.Barcode))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "原单查询失败: "+err.Error())
+			return
+		}
+		if soldPrice > 0 && sl.RefundPrice > soldPrice {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 退款 ¥%.2f 超过原成交价 ¥%.2f", sl.Barcode, sl.RefundPrice, soldPrice))
+			return
+		}
+		sl.OrigDocID, sl.OrigDocNo, sl.SoldPrice = docID, docNo, soldPrice
+		res, err := tx.Exec(`UPDATE item SET status='退货中', version=version+1
+			WHERE barcode=$1 AND status='已售'`, sl.Barcode)
+		if err != nil {
+			writeErr(w, 500, "锁定货品失败: "+err.Error())
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, sl.Barcode).Scan(&cur)
+			writeErr(w, 400, fmt.Sprintf("条码 %s 当前状态「%s」——只有已售的件才能销退，整单未保存", sl.Barcode, cur))
+			return
+		}
+	}
+	linesJSON, _ := json.Marshal(lines)
+
+	if req.ID == 0 {
+		today := time.Now().Format("20060102")
+		seq, err := nextSeq(tx, "XT", today)
+		if err != nil {
+			writeErr(w, 500, "单号发号失败: "+err.Error())
+			return
+		}
+		if seq > 99 {
+			writeErr(w, 400, "当日销退单号已满99张")
+			return
+		}
+		docNo := fmt.Sprintf("XT%s%02d", today, seq)
+		var docID int64
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines, payments)
+			VALUES ($1,'sale_return','草稿',$2,$3,$4) RETURNING id`,
+			docNo, currentUID(r), linesJSON, paysJSON).Scan(&docID)
+		if err != nil {
+			writeErr(w, 500, "保存失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
+		return
+	}
+	if _, err := tx.Exec(`UPDATE doc SET draft_lines=$1, payments=$2 WHERE id=$3`,
+		linesJSON, paysJSON, req.ID); err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/sale-return/confirm {id} —— 退款确认：货回在库 + 退款校验，一个事务
+func handleSaleReturnConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE doc SET status='已确认', confirmed_at=now()
+		WHERE id=$1 AND doc_type='sale_return' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
+		return
+	}
+	var linesJSON, paysJSON []byte
+	if err := tx.QueryRow(`SELECT draft_lines, payments FROM doc WHERE id=$1`, req.ID).
+		Scan(&linesJSON, &paysJSON); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var lines []SRLine
+	if err := json.Unmarshal(linesJSON, &lines); err != nil || len(lines) == 0 {
+		writeErr(w, 400, "草稿明细为空，无法确认")
+		return
+	}
+	var pays []PayLine
+	_ = json.Unmarshal(paysJSON, &pays)
+	if len(pays) == 0 {
+		writeErr(w, 400, "请先录入退款方式再确认")
+		return
+	}
+	if err := validatePayments(pays); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	for _, p := range pays {
+		var en bool
+		err := tx.QueryRow(`SELECT enabled FROM dict_item WHERE dict_type='pay_method' AND name=$1`,
+			p.Method).Scan(&en)
+		if err != nil || !en {
+			writeErr(w, 400, fmt.Sprintf("退款方式「%s」不存在或已停用", p.Method))
+			return
+		}
+	}
+	var total float64
+	for i, l := range lines {
+		var itemID int64
+		err := tx.QueryRow(`UPDATE item SET status='在库', version=version+1
+			WHERE barcode=$1 AND status='退货中' RETURNING id`, l.Barcode).Scan(&itemID)
+		if err == sql.ErrNoRows {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE barcode=$1`, l.Barcode).Scan(&cur)
+			writeErr(w, 400, fmt.Sprintf("第%d行条码 %s 当前状态「%s」，整单未确认", i+1, l.Barcode, cur))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "更新货品失败: "+err.Error())
+			return
+		}
+		total += l.RefundPrice
+		if _, err = tx.Exec(`INSERT INTO doc_line (doc_id, item_id, line_no) VALUES ($1,$2,$3)`,
+			req.ID, itemID, i+1); err != nil {
+			writeErr(w, 500, "写入明细失败: "+err.Error())
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, to_loc, operator_id)
+			VALUES ($1,$2,'退货中','在库','总库',$3)`, itemID, req.ID, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	var paySum float64
+	for _, p := range pays {
+		paySum += p.Amount
+	}
+	if round2(paySum) != round2(total) {
+		writeErr(w, 400, fmt.Sprintf("退款合计 ¥%.2f 与应退合计 ¥%.2f 不一致，整单未确认", paySum, total))
+		return
+	}
+	if _, err = tx.Exec(`UPDATE doc SET total_amount=$1 WHERE id=$2`, round2(total), req.ID); err != nil {
+		writeErr(w, 500, "写入合计失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认", "totalAmount": round2(total)})
+}
+
+// POST /api/doc/sale-return/unconfirm {id} —— 仅限当日；货 在库→退货中（草稿仍占着）
+func handleSaleReturnUnconfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE doc SET status='草稿', confirmed_at=NULL, total_amount=0
+		WHERE id=$1 AND doc_type='sale_return' AND status='已确认'
+		AND confirmed_at::date = CURRENT_DATE`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "反确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "反确认失败：单据不存在、不是已确认状态，或已跨日")
+		return
+	}
+	rows, err := tx.Query(`SELECT it.id, it.barcode FROM doc_line dl
+		JOIN item it ON it.id = dl.item_id WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "明细查询失败: "+err.Error())
+		return
+	}
+	type ref struct {
+		id      int64
+		barcode string
+	}
+	var refs []ref
+	for rows.Next() {
+		var rf ref
+		if err := rows.Scan(&rf.id, &rf.barcode); err != nil {
+			rows.Close()
+			writeErr(w, 500, "明细读取失败: "+err.Error())
+			return
+		}
+		refs = append(refs, rf)
+	}
+	rows.Close()
+	for _, rf := range refs {
+		// 件回库后可能已被再次销售/退库占用——条件更新抢不回就整单拒绝
+		res, err := tx.Exec(`UPDATE item SET status='退货中', version=version+1
+			WHERE id=$1 AND status='在库'`, rf.id)
+		if err != nil {
+			writeErr(w, 500, "恢复货品失败: "+err.Error())
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var cur string
+			_ = tx.QueryRow(`SELECT status FROM item WHERE id=$1`, rf.id).Scan(&cur)
+			writeErr(w, 400, fmt.Sprintf("反确认被拒绝：条码 %s 当前状态「%s」（退回的货可能已被再次占用）", rf.barcode, cur))
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO stock_flow (item_id, doc_id, from_status, to_status, from_loc, operator_id)
+			VALUES ($1,$2,'在库','退货中','总库',$3)`, rf.id, req.ID, currentUID(r)); err != nil {
+			writeErr(w, 500, "写入流水失败: "+err.Error())
+			return
+		}
+	}
+	if _, err = tx.Exec(`DELETE FROM doc_line WHERE doc_id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "删除明细失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/sale-return/delete {id} —— 删草稿同时把件放回"已售"
+func handleSaleReturnDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var old []byte
+	err = tx.QueryRow(`SELECT draft_lines FROM doc
+		WHERE id=$1 AND doc_type='sale_return' AND status='草稿' FOR UPDATE`, req.ID).Scan(&old)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, "删除失败：只有草稿可以删除")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var oldLines []SRLine
+	_ = json.Unmarshal(old, &oldLines)
+	for _, ol := range oldLines {
+		if _, err := tx.Exec(`UPDATE item SET status='已售', version=version+1
+			WHERE barcode=$1 AND status='退货中'`, ol.Barcode); err != nil {
+			writeErr(w, 500, "解锁货品失败: "+err.Error())
+			return
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM doc WHERE id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "删除失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": req.ID})
+}
+
+// GET /api/doc/sale-return —— 销退单列表
+func handleSaleReturnList(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT id, doc_no, status, draft_lines, total_amount, payments,
+		to_char(created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc WHERE doc_type='sale_return' ORDER BY id DESC LIMIT 20`)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type RDoc struct {
+		ID          int64     `json:"id"`
+		DocNo       string    `json:"docNo"`
+		Status      string    `json:"status"`
+		TotalAmount float64   `json:"totalAmount"`
+		Payments    []PayLine `json:"payments"`
+		Lines       []SRLine  `json:"lines"`
+		MadeAt      string    `json:"madeAt"`
+	}
+	docs := []RDoc{}
+	for rows.Next() {
+		var d RDoc
+		var dl, pj []byte
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &d.TotalAmount, &pj, &d.MadeAt); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		d.Lines = []SRLine{}
+		_ = json.Unmarshal(dl, &d.Lines)
+		d.Payments = []PayLine{}
+		_ = json.Unmarshal(pj, &d.Payments)
+		docs = append(docs, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	// 查询参数：status(状态) category(大类) q(条码前缀或名称模糊) —— 都可选
 	q := r.URL.Query()
@@ -2288,6 +2786,12 @@ func main() {
 	mux.HandleFunc("POST /api/doc/sale/unconfirm", withAuth(handleSaleUnconfirm))
 	mux.HandleFunc("POST /api/doc/sale/delete", withAuth(handleSaleDelete))
 	mux.HandleFunc("GET /api/doc/sale", withAuth(handleSaleList))
+	mux.HandleFunc("GET /api/sale-return/lookup", withAuth(handleSaleReturnLookup))
+	mux.HandleFunc("POST /api/doc/sale-return/save", withAuth(handleSaleReturnSave))
+	mux.HandleFunc("POST /api/doc/sale-return/confirm", withAuth(handleSaleReturnConfirm))
+	mux.HandleFunc("POST /api/doc/sale-return/unconfirm", withAuth(handleSaleReturnUnconfirm))
+	mux.HandleFunc("POST /api/doc/sale-return/delete", withAuth(handleSaleReturnDelete))
+	mux.HandleFunc("GET /api/doc/sale-return", withAuth(handleSaleReturnList))
 
 	fmt.Println("后端已启动: http://localhost:8080/api/health  (Ctrl+C 停止)")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

@@ -76,6 +76,15 @@ export const api = {
   outboundDelete: (id: number) => request('POST', '/api/doc/outbound/delete', { id }),
   outboundList: () => request('GET', '/api/doc/outbound'),
 
+  // 销退单（v0.17）
+  saleReturnLookup: (barcode: string) =>
+    request('GET', `/api/sale-return/lookup?barcode=${encodeURIComponent(barcode)}`),
+  saleReturnSave: (payload: unknown) => request('POST', '/api/doc/sale-return/save', payload),
+  saleReturnConfirm: (id: number) => request('POST', '/api/doc/sale-return/confirm', { id }),
+  saleReturnUnconfirm: (id: number) => request('POST', '/api/doc/sale-return/unconfirm', { id }),
+  saleReturnDelete: (id: number) => request('POST', '/api/doc/sale-return/delete', { id }),
+  saleReturnList: () => request('GET', '/api/doc/sale-return'),
+
   saleSave: (payload: unknown) => request('POST', '/api/doc/sale/save', payload),
   saleConfirm: (id: number) => request('POST', '/api/doc/sale/confirm', { id }),
   saleUnconfirm: (id: number) => request('POST', '/api/doc/sale/unconfirm', { id }),
