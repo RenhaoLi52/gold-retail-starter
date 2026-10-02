@@ -111,6 +111,7 @@ type InboundDoc struct {
 	Status   string `json:"status"` // 草稿 / 已确认
 	Items    []Item `json:"items"`
 	MadeAt   string `json:"madeAt"`
+	MadeBy   string `json:"madeBy"` // 制单人（v0.31 工作台概览列）
 }
 
 var db *sql.DB
@@ -5592,9 +5593,10 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(`
-		SELECT id, doc_no, COALESCE(category,''), status, draft_lines,
-		       to_char(created_at,'YYYY-MM-DD HH24:MI:SS')
-		FROM doc WHERE doc_type='inbound' ORDER BY id DESC LIMIT 20`)
+		SELECT d.id, d.doc_no, COALESCE(d.category,''), d.status, d.draft_lines,
+		       to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS'), COALESCE(u.name,'')
+		FROM doc d LEFT JOIN app_user u ON u.id = d.maker_id
+		WHERE d.doc_type='inbound' ORDER BY d.id DESC LIMIT 20`)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
@@ -5606,7 +5608,7 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d InboundDoc
 		var dl []byte
-		if err := rows.Scan(&d.ID, &d.DocNo, &d.Category, &d.Status, &dl, &d.MadeAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Category, &d.Status, &dl, &d.MadeAt, &d.MadeBy); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}

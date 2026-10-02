@@ -4,9 +4,42 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, setToken, hasToken, clearToken, downloadFile, uploadFile } from './api'
 import Icon from './components/Icon.vue'
+import InboundList from './components/InboundList.vue'
+import InboundDoc from './components/InboundDoc.vue'
 
 // ===== UI壳（v0.30）：16:9等比画布 + 侧边栏分页 =====
-const page = ref('sale')
+// ===== 页签（v0.31，仿JMP多页同开）=====
+// 模块页签按 kind 单例（再点导航=聚焦）；入库单据页签按 docId 单例；新建单每点一次开一张。
+interface Tab { id: string; kind: string; title: string; icon: string; docId?: number }
+const tabs = ref<Tab[]>([])
+const activeTabId = ref('')
+let tabSeq = 0
+const page = computed(() => tabs.value.find(t => t.id === activeTabId.value)?.kind ?? '')
+// 导航高亮：单据页签归属它的模块
+const navKey = computed(() => (page.value === 'inboundDoc' ? 'inbound' : page.value))
+
+function openTab(kind: string, title: string, icon: string, opts?: { docId?: number; multi?: boolean }): Tab {
+  if (!opts?.multi) {
+    const exist = tabs.value.find(t => t.kind === kind
+      && (opts?.docId === undefined ? t.docId === undefined : t.docId === opts.docId))
+    if (exist) { activeTabId.value = exist.id; return exist }
+  }
+  const t: Tab = { id: 'tab' + ++tabSeq, kind, title, icon, docId: opts?.docId }
+  tabs.value.push(t)
+  activeTabId.value = t.id
+  return t
+}
+function closeTab(tid: string) {
+  const i = tabs.value.findIndex(t => t.id === tid)
+  if (i < 0) return
+  tabs.value.splice(i, 1)
+  delete docInitials.value[tid]
+  if (activeTabId.value === tid) activeTabId.value = tabs.value[Math.min(i, tabs.value.length - 1)]?.id ?? ''
+}
+function renameTab(tid: string, title: string) {
+  const t = tabs.value.find(x => x.id === tid)
+  if (t) t.title = title
+}
 const stageScale = ref(1)
 function fitStage() {
   stageScale.value = Math.min(window.innerWidth / 1600, window.innerHeight / 900)
@@ -56,12 +89,33 @@ const placeholderPages: Record<string, { label: string; icon: string }> = {
   settings: { label: '系统参数', icon: 'settings' },
 }
 function goPage(k: string) {
-  page.value = k
   errMsg.value = ''
+  const def = navDef.flatMap(g => g.items).find(m => m.key === k)
+  openTab(k, def?.label ?? k, def?.icon ?? 'book')
   // 懒加载的管理页
   if (k === 'users') loadUsers()
   if (k === 'rules') loadRules()
   if (k === 'report') loadReport()
+}
+
+// ===== 入库单据页签（v0.31）=====
+// 打开时把列表里的单据快照带给组件做初始数据；之后组件自管状态。
+const docInitials = ref<Record<string, InboundDocData | null>>({})
+interface InboundDocData { id: number; docNo: string; category: string; status: string; items: Item[]; madeAt: string; madeBy?: string }
+
+function openInboundDoc(d: InboundDocData) {
+  const t = openTab('inboundDoc', d.docNo, 'inbound', { docId: d.id })
+  if (!(t.id in docInitials.value)) docInitials.value[t.id] = d
+}
+function openInboundNew() {
+  const t = openTab('inboundDoc', '新建入库单', 'inbound', { multi: true })
+  docInitials.value[t.id] = null
+}
+async function onImported(r: { id: number; docNo: string; count: number }) {
+  flash(`已导入 ${r.count} 行到草稿 ${r.docNo}——请复核后确认`)
+  await refreshAll()
+  const d = docs.value.find(x => x.id === r.id)
+  if (d) openInboundDoc(d as unknown as InboundDocData)
 }
 
 // ===== 登录 =====
@@ -115,20 +169,6 @@ interface Doc {
 }
 const docs = ref<Doc[]>([])
 
-// ===== 编辑中的单据（表单状态） =====
-interface Line {
-  barcode: string
-  purity: string
-  stoneName: string
-  jewelType: string
-  weightG: number | null
-  price: number | null
-  saleFeeMode: string
-  saleFee: number | null
-  costGoldPrice: number | null
-  costFeeMode: string
-  costFee: number | null
-}
 // ===== 金价 =====
 interface GoldPrice {
   purity: string
@@ -1399,21 +1439,6 @@ async function changePwd() {
   }
 }
 
-const editingId = ref(0) // 0=新单；>0=正在编辑的草稿id
-const editingNo = ref('')
-const category = ref('黄金')
-const lines = ref<Line[]>([{ barcode: '', purity: '足金999.9', stoneName: '', jewelType: '', weightG: null, price: null,
-  saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null }])
-// v0.28：名称=成色+主石+类别 实时预览（真正的拼接在服务端做）
-const composedName = (l: Line) => `${l.purity}${l.stoneName}${l.jewelType}`
-
-function resetForm() {
-  editingId.value = 0
-  editingNo.value = ''
-  category.value = '黄金'
-  lines.value = [{ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null }]
-}
-
 function flash(ok: string) {
   okMsg.value = ok
   errMsg.value = ''
@@ -1431,6 +1456,7 @@ async function doLogin() {
     userStoreId.value = r.storeId || 0
     isHQ.value = !r.storeId
     logged.value = true
+    goPage('sale')
     await refreshAll()
   } catch (e) {
     errMsg.value = (e as Error).message
@@ -1440,6 +1466,9 @@ async function doLogin() {
 function doLogout() {
   clearToken()
   logged.value = false
+  tabs.value = []
+  activeTabId.value = ''
+  docInitials.value = {}
   userLabel.value = ''
   isAdmin.value = false
   userStore.value = ''
@@ -1460,6 +1489,7 @@ onMounted(async () => {
     userStoreId.value = r.storeId || 0
     isHQ.value = !r.storeId
     logged.value = true
+    goPage('sale')
     await refreshAll()
   } catch {
     // 恢复失败不弹错——用户看到登录页自然会重新登录
@@ -1492,163 +1522,6 @@ async function refreshAll() {
   await loadSalespersons()
 }
 
-// v0.29：Excel 批量入库导入（全有或全无，停在出错行）
-const importFileEl = ref<HTMLInputElement | null>(null)
-async function downloadImportTemplate() {
-  errMsg.value = ''
-  try {
-    await downloadFile('/api/doc/inbound/import-template', '入库导入模板.xlsx')
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-async function importExcel(ev: Event) {
-  errMsg.value = ''
-  const input = ev.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = '' // 允许连续导入同名文件
-  if (!file) return
-  try {
-    const r = await uploadFile('/api/doc/inbound/import', file, { category: category.value })
-    flash(`已导入 ${r.count} 行到草稿 ${r.docNo}——请复核后确认`)
-    await refreshAll()
-    const d = docs.value.find(x => x.id === r.id)
-    if (d) editDoc(d)
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-
-// v0.26：导出该入库单的 Label Matrix 标签数据文件
-async function exportLabels(d: Doc) {
-  errMsg.value = ''
-  try {
-    await downloadFile(`/api/doc/inbound/labels?id=${d.id}`, `标签数据-${d.docNo}.xlsx`)
-    flash(`标签数据已导出：${d.docNo}——在 Label Matrix 里把数据源指向该文件即可打印`)
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-
-function addLine() {
-  lines.value.push({ barcode: '', purity: '足金999.9', stoneName: '', jewelType: '', weightG: null, price: null,
-    saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null })
-}
-function removeLine(i: number) {
-  lines.value.splice(i, 1)
-}
-
-function payload() {
-  return {
-    id: editingId.value,
-    category: category.value,
-    lines: lines.value.map((l) => ({
-      barcode: l.barcode,
-      purity: l.purity,
-      stoneName: l.stoneName.trim(),
-      jewelType: l.jewelType.trim(),
-      weightG: Number(l.weightG) || 0,
-      price: Number(l.price) || 0,
-      saleFeeMode: l.saleFeeMode,
-      saleFee: Number(l.saleFee) || 0,
-      costGoldPrice: Number(l.costGoldPrice) || 0,
-      costFeeMode: l.costFeeMode,
-      costFee: Number(l.costFee) || 0,
-    })),
-  }
-}
-
-// 保存草稿：新单取号占号；旧草稿原地更新
-async function saveDraft() {
-  errMsg.value = ''
-  try {
-    const r = await api.inboundSave(payload())
-    if (editingId.value === 0) {
-      editingId.value = r.id
-      editingNo.value = r.docNo
-    }
-    flash(`草稿已保存${editingNo.value ? '：' + editingNo.value : ''}`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-
-// 保存并确认：先存草稿再确认（库存在"确认"那一刻才真正变动）
-async function saveAndConfirm() {
-  errMsg.value = ''
-  try {
-    const r = await api.inboundSave(payload())
-    const id = editingId.value || r.id
-    const doc = await api.inboundConfirm(id)
-    flash(`已确认：${doc.docNo}，生成 ${doc.items.length} 件货品`)
-    resetForm()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll() // 保存可能已成功，刷新列表让草稿可见
-  }
-}
-
-// 列表操作
-async function confirmDoc(d: Doc) {
-  errMsg.value = ''
-  try {
-    const doc = await api.inboundConfirm(d.id)
-    flash(`已确认：${doc.docNo}`)
-    if (editingId.value === d.id) resetForm()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-
-async function unconfirmDoc(d: Doc) {
-  errMsg.value = ''
-  try {
-    await api.inboundUnconfirm(d.id)
-    flash(`已反确认：${d.docNo} 退回草稿，货品已撤回`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-
-async function deleteDoc(d: Doc) {
-  errMsg.value = ''
-  try {
-    await api.inboundDelete(d.id)
-    flash(`草稿 ${d.docNo} 已删除（单号不回收）`)
-    if (editingId.value === d.id) resetForm()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-
-// 把草稿装进表单继续编辑
-function editDoc(d: Doc) {
-  editingId.value = d.id
-  editingNo.value = d.docNo
-  category.value = d.category
-  lines.value = d.items.map((it) => ({
-    barcode: it.barcode,
-    purity: it.purity,
-    stoneName: it.stoneName ?? '',
-    jewelType: it.jewelType ?? (it.stoneName === undefined ? it.name : ''), // 老草稿退回整名
-
-    weightG: it.weightG,
-    price: it.price ?? 0,
-    saleFeeMode: it.saleFeeMode || '按克',
-    saleFee: it.saleFee ?? 0,
-    costGoldPrice: it.costGoldPrice ?? 0,
-    costFeeMode: it.costFeeMode || '按克',
-    costFee: it.costFee ?? 0,
-  }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
 </script>
 
 <template>
@@ -1677,7 +1550,7 @@ function editDoc(d: Doc) {
             <div v-for="g in visibleNav" :key="g.title" class="nav-group">
               <div class="nav-title">{{ g.title }}</div>
               <a v-for="m in g.items" :key="m.key"
-                :class="['nav-item', page === m.key ? 'active' : '']"
+                :class="['nav-item', navKey === m.key ? 'active' : '']"
                 @click="goPage(m.key)">
                 <Icon :name="m.icon" :size="15" />
                 <span>{{ m.label }}</span>
@@ -1703,7 +1576,22 @@ function editDoc(d: Doc) {
             <button class="mini" @click="doLogout"><Icon name="logout" :size="13" /> 退出</button>
           </header>
 
+          <!-- 页签栏（v0.31）：多业务页同开，点切换，×关闭 -->
+          <div class="tabstrip">
+            <div v-for="t in tabs" :key="t.id" :class="['tab', t.id === activeTabId ? 'active' : '']"
+              @click="activeTabId = t.id">
+              <Icon :name="t.icon" :size="13" />
+              <span>{{ t.title }}</span>
+              <span class="tab-x" title="关闭" @click.stop="closeTab(t.id)">×</span>
+            </div>
+          </div>
+
           <div class="content">
+            <section v-if="!tabs.length" class="card placeholder">
+              <Icon name="gem" :size="40" />
+              <h2>从左侧菜单打开一个页面</h2>
+              <p class="hint">页签可以同时开多个，互相切换互不干扰。</p>
+            </section>
       <div v-if="showPwd" class="card">
         <div class="row">
           <label>旧密码 <input v-model="oldPwd" type="password" /></label>
@@ -2434,101 +2322,19 @@ function editDoc(d: Doc) {
       </template>
 
       <template v-if="page==='inbound'">
+        <!-- 入库工作台（v0.31）：上=单据概览(单击预览/双击取单)，下=明细预览 -->
+        <InboundList v-if="isHQ" :docs="docs" :dicts="dicts"
+          @refresh="refreshAll" @flash="flash"
+          @open="openInboundDoc" @create="openInboundNew" @imported="onImported" />
+      </template>
 
-      <!-- 开单表单 -->
-      <section v-if="isHQ" class="card">
-        <h2>
-          {{ editingId ? `编辑草稿 ${editingNo}` : '新建入库单' }}
-          <button v-if="editingId" class="mini" @click="resetForm">放弃编辑，新建</button>
-        </h2>
-        <div class="row">
-          <label>首饰大类
-            <select v-model="category">
-              <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
-            </select>
-          </label>
-          <span class="spacer"></span>
-          <button class="mini" @click="downloadImportTemplate">下载导入模板</button>
-          <button class="mini" @click="importFileEl?.click()">Excel导入</button>
-          <input ref="importFileEl" type="file" accept=".xlsx" style="display:none" @change="importExcel" />
-        </div>
-        <table>
-          <thead>
-            <tr><th>#</th><th>条码号(留空自动生成)</th><th>成色</th><th>主石名称</th><th>首饰类别</th><th>名称(自动)</th><th>总件重(g)</th><th>售价(¥)</th><th>销售工费</th><th>进货金价</th><th>进货工费</th><th></th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="(l, i) in lines" :key="i">
-              <td>{{ i + 1 }}</td>
-              <td><input v-model="l.barcode" placeholder="自动生成" style="width:110px" /></td>
-              <td><input v-model="l.purity" list="dlPurity" style="width:92px" /></td>
-              <td><input v-model="l.stoneName" list="dlStone" placeholder="素金留空" style="width:84px" /></td>
-              <td><input v-model="l.jewelType" list="dlJewel" style="width:76px" /></td>
-              <td class="hint">{{ composedName(l) || '—' }}</td>
-              <td><input v-model.number="l.weightG" type="number" step="0.01" style="width:80px" /></td>
-              <td><input v-model.number="l.price" type="number" step="1" placeholder="0" style="width:80px" /></td>
-              <td>
-                <select v-model="l.saleFeeMode" style="width:64px"><option>按克</option><option>按件</option></select>
-                <input v-model.number="l.saleFee" type="number" step="0.5" placeholder="0" style="width:64px" />
-              </td>
-              <td><input v-model.number="l.costGoldPrice" type="number" step="0.01" placeholder="0" style="width:80px" /></td>
-              <td>
-                <select v-model="l.costFeeMode" style="width:64px"><option>按克</option><option>按件</option></select>
-                <input v-model.number="l.costFee" type="number" step="0.5" placeholder="0" style="width:64px" />
-              </td>
-              <td><button class="mini" @click="removeLine(i)" :disabled="lines.length === 1">删行</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <datalist id="dlPurity">
-          <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name" />
-        </datalist>
-        <datalist id="dlStone">
-          <option v-for="s in dicts.stone_name.filter(x => x.enabled)" :key="s.id" :value="s.name" />
-        </datalist>
-        <datalist id="dlJewel">
-          <option v-for="jt in dicts.jewel_type.filter(x => x.enabled)" :key="jt.id" :value="jt.name" />
-        </datalist>
-        <div class="row">
-          <button class="mini" @click="addLine">+ 增加行</button>
-          <button class="gray" @click="saveDraft">保存草稿</button>
-          <button @click="saveAndConfirm">保存并确认</button>
-        </div>
-        <p class="hint">名称=成色+主石名称+首饰类别 自动拼接；三个字段可下拉选也可直接填，确认时新值自动补进字典。按克货售价可填0，销售按 克重×金价+销售工费；进货金价/工费是成本（仅管理员可见）。</p>
-      </section>
-
-      <!-- 单据列表 -->
-      <section v-if="isHQ" class="card">
-        <h2>入库单列表（{{ docs.length }} 张） <button class="mini" @click="refreshAll">刷新</button></h2>
-        <div v-for="d in docs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span>{{ d.category }}</span>
-            <span class="hint">{{ (d.items?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="editDoc(d)">编辑</button>
-              <button class="mini" @click="confirmDoc(d)">确认</button>
-              <button class="mini danger" @click="deleteDoc(d)">删除</button>
-            </template>
-            <template v-else>
-              <button class="mini" @click="exportLabels(d)">导出标签</button>
-              <button class="mini danger" @click="unconfirmDoc(d)">反确认</button>
-            </template>
-          </div>
-          <table v-if="d.items?.length">
-            <tbody>
-              <tr v-for="(it, j) in d.items" :key="j">
-                <td class="mono" style="width:160px">{{ it.barcode || '(待发号)' }}</td>
-                <td>{{ it.name }}</td>
-                <td style="width:110px">{{ it.purity }}</td>
-                <td style="width:90px">{{ (it.weightG ?? 0).toFixed(2) }}g</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+      <!-- 入库单据页签（v0.31）：v-show 保活，可同开多张单互不丢编辑状态 -->
+      <template v-for="t in tabs" :key="t.id">
+        <InboundDoc v-if="t.kind === 'inboundDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="docInitials[t.id] ?? null"
+          :dicts="dicts" :is-admin="isAdmin"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
       </template>
 
       <template v-if="page==='outbound'">
@@ -2882,6 +2688,33 @@ td input { width: 100%; box-sizing: border-box; border: 1px solid #ddd; }
 .badge.draft { background: #fdf2d0; color: #8a6d1a; }
 .badge.ok2 { background: #ddf0e3; color: #22663d; }
 .spacer { flex: 1; }
+
+/* --- 页签栏（v0.31） --- */
+.tabstrip {
+  height: 34px; flex-shrink: 0; display: flex; align-items: flex-end; gap: 2px;
+  padding: 0 10px; background: #e2e5e1; border-bottom: 1px solid var(--line);
+  overflow-x: auto; overflow-y: hidden;
+}
+.tab {
+  display: flex; align-items: center; gap: 6px; padding: 5px 7px 5px 12px;
+  font-size: 12.5px; color: #555; background: #d4d8d3; border-radius: 6px 6px 0 0;
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+.tab.active { background: var(--content-bg); color: var(--ink); font-weight: 600; box-shadow: inset 0 2px 0 var(--gold); }
+.tab-x {
+  width: 16px; height: 16px; line-height: 15px; text-align: center;
+  border-radius: 50%; font-size: 13px; color: #888;
+}
+.tab-x:hover { background: rgba(0,0,0,.14); color: #000; }
+
+/* --- 工作台概览/预览表格（v0.31） --- */
+.grid-scroll { max-height: 330px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; }
+.grid-scroll.preview { max-height: 290px; }
+.grid-scroll table { margin: 0; }
+.grid-scroll thead th { position: sticky; top: 0; z-index: 1; }
+table.pick tbody tr { cursor: pointer; }
+table.pick tbody tr:hover { background: #f5f7f3; }
+table.pick tbody tr.sel { background: #fcf4de; }
 
 /* --- 规划中的空页面 --- */
 .placeholder {
