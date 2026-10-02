@@ -2,10 +2,16 @@
 // 入库单界面 v0.3：支持单据生命周期——保存草稿 → 确认 → 反确认 / 删除草稿
 // 草稿可反复编辑；确认后生成货品件进入库存；反确认撤回（条码保留）。
 import { computed, onMounted, ref } from 'vue'
-import { api, setToken, hasToken, clearToken, downloadFile, uploadFile } from './api'
+import { api, setToken, hasToken, clearToken, downloadFile } from './api'
 import Icon from './components/Icon.vue'
-import InboundList from './components/InboundList.vue'
+import DocWorkbench from './components/DocWorkbench.vue'
 import InboundDoc from './components/InboundDoc.vue'
+import OutboundDoc from './components/OutboundDoc.vue'
+import TransferDoc from './components/TransferDoc.vue'
+import SaleDoc from './components/SaleDoc.vue'
+import SaleReturnDoc from './components/SaleReturnDoc.vue'
+import RecycleDoc from './components/RecycleDoc.vue'
+import StocktakeDoc from './components/StocktakeDoc.vue'
 
 // ===== UI壳（v0.30）：16:9等比画布 + 侧边栏分页 =====
 // ===== 页签（v0.31，仿JMP多页同开）=====
@@ -16,7 +22,11 @@ const activeTabId = ref('')
 let tabSeq = 0
 const page = computed(() => tabs.value.find(t => t.id === activeTabId.value)?.kind ?? '')
 // 导航高亮：单据页签归属它的模块
-const navKey = computed(() => (page.value === 'inboundDoc' ? 'inbound' : page.value))
+const docKindModule: Record<string, string> = {
+  inboundDoc: 'inbound', outboundDoc: 'outbound', transferDoc: 'transfer',
+  saleDoc: 'sale', saleReturnDoc: 'saleReturn', recycleDoc: 'recycle', stocktakeDoc: 'stocktake',
+}
+const navKey = computed(() => docKindModule[page.value] ?? page.value)
 
 function openTab(kind: string, title: string, icon: string, opts?: { docId?: number; multi?: boolean }): Tab {
   if (!opts?.multi) {
@@ -98,24 +108,25 @@ function goPage(k: string) {
   if (k === 'report') loadReport()
 }
 
-// ===== 入库单据页签（v0.31）=====
-// 打开时把列表里的单据快照带给组件做初始数据；之后组件自管状态。
-const docInitials = ref<Record<string, InboundDocData | null>>({})
-interface InboundDocData { id: number; docNo: string; category: string; status: string; items: Item[]; madeAt: string; madeBy?: string }
-
-function openInboundDoc(d: InboundDocData) {
-  const t = openTab('inboundDoc', d.docNo, 'inbound', { docId: d.id })
+// ===== 单据页签（v0.31入库首发，v0.32七种单据通用）=====
+// 打开时把列表里的单据快照带给组件做初始数据；之后组件自管状态（每页签一套，互不串）。
+const docInitials = ref<Record<string, unknown>>({})
+const docTabDefs: Record<string, { newTitle: string; icon: string }> = {
+  inboundDoc: { newTitle: '新建入库单', icon: 'inbound' },
+  outboundDoc: { newTitle: '新建退库单', icon: 'outbound' },
+  transferDoc: { newTitle: '新建调拨单', icon: 'transfer' },
+  saleDoc: { newTitle: '新建销售单', icon: 'sale' },
+  saleReturnDoc: { newTitle: '新建销退单', icon: 'return' },
+  recycleDoc: { newTitle: '新建回收单', icon: 'recycle' },
+  stocktakeDoc: { newTitle: '新建盘点单', icon: 'stocktake' },
+}
+function openDocTab(kind: string, d: { id: number; docNo: string }) {
+  const t = openTab(kind, d.docNo, docTabDefs[kind].icon, { docId: d.id })
   if (!(t.id in docInitials.value)) docInitials.value[t.id] = d
 }
-function openInboundNew() {
-  const t = openTab('inboundDoc', '新建入库单', 'inbound', { multi: true })
+function openNewDocTab(kind: string) {
+  const t = openTab(kind, docTabDefs[kind].newTitle, docTabDefs[kind].icon, { multi: true })
   docInitials.value[t.id] = null
-}
-async function onImported(r: { id: number; docNo: string; count: number }) {
-  flash(`已导入 ${r.count} 行到草稿 ${r.docNo}——请复核后确认`)
-  await refreshAll()
-  const d = docs.value.find(x => x.id === r.id)
-  if (d) openInboundDoc(d as unknown as InboundDocData)
 }
 
 // ===== 登录 =====
@@ -243,225 +254,6 @@ interface SDoc {
   madeAt: string
 }
 const sdocs = ref<SDoc[]>([])
-const slEditingId = ref(0)
-const slEditingNo = ref('')
-const slLines = ref<SaleLine[]>([])
-const slInput = ref('')
-const slSalespersonIds = ref<number[]>([])
-const slPays = ref<PayLine[]>([])
-// v0.24 旧料区（以旧换新/旧料回收）
-interface SlOld {
-  category: string
-  purity: string
-  weightG: number | null
-}
-const slOld = ref<SlOld[]>([])
-function slAddOld() {
-  slOld.value.push({
-    category: enabledCats()[0]?.name ?? '',
-    purity: enabledPurities()[0]?.name ?? '',
-    weightG: null,
-  })
-}
-function slRemoveOld(i: number) {
-  slOld.value.splice(i, 1)
-}
-function tradeRateOf(purity: string): number {
-  return goldPrices.value.find(g => g.purity === purity)?.tradePrice ?? 0
-}
-function recycleRateOf(purity: string): number {
-  return goldPrices.value.find(g => g.purity === purity)?.recyclePrice ?? 0
-}
-// 预览拆分（与服务端同口径：金换金银换银、按录入顺序占额度；确认时以服务端为准）
-function slOldSplit() {
-  const quota: Record<string, number> = {}
-  for (const l of slLines.value) {
-    const it = items.value.find(x => x.barcode === l.barcode)
-    const c = it?.category ?? ''
-    quota[c] = (quota[c] ?? 0) + (Number(l.weightG) || 0)
-  }
-  const used: Record<string, number> = {}
-  return slOld.value.map(o => {
-    const w = Number(o.weightG) || 0
-    const avail = Math.max((quota[o.category] ?? 0) - (used[o.category] ?? 0), 0)
-    const tradeG = Math.min(w, avail)
-    used[o.category] = (used[o.category] ?? 0) + tradeG
-    const recycleG = w - tradeG
-    const credit = tradeG * tradeRateOf(o.purity) + recycleG * recycleRateOf(o.purity)
-    return { tradeG, recycleG, credit: Math.round(credit * 100) / 100 }
-  })
-}
-const slCredit = () => slOldSplit().reduce((s2, x) => s2 + x.credit, 0)
-const slNet = () => Math.round((slTotal() - slCredit()) * 100) / 100
-
-function slReset() {
-  slEditingId.value = 0
-  slEditingNo.value = ''
-  slLines.value = []
-  slInput.value = ''
-  slSalespersonIds.value = []
-  slPays.value = []
-  slOld.value = []
-}
-// 多售货员：点名字切换选中，最多3人（v0.20）
-function slToggleSp(id: number) {
-  const i = slSalespersonIds.value.indexOf(id)
-  if (i >= 0) {
-    slSalespersonIds.value.splice(i, 1)
-  } else {
-    if (slSalespersonIds.value.length >= 3) {
-      errMsg.value = '售货员最多3人'
-      return
-    }
-    slSalespersonIds.value.push(id)
-  }
-}
-
-// ===== 组合收款（v0.14） =====
-function slAddPay() {
-  // 默认选第一个还没用过的方式
-  const used = new Set(slPays.value.map(p => p.method))
-  const next = enabledPayMethods().find(m => !used.has(m.name))
-  slPays.value.push({ method: next?.name ?? '', amount: null })
-}
-function slRemovePay(i: number) {
-  slPays.value.splice(i, 1)
-}
-const slPayTotal = () => slPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
-// 补足：把这一笔金额填成"应收 - 其他各笔合计"（顾客现金+微信各付一部分时特别省事）
-function slFillPay(p: PayLine) {
-  const others = slPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
-  p.amount = Math.round((Math.abs(slNet()) - others) * 100) / 100
-}
-function goldRateOf(purity: string): number {
-  return goldPrices.value.find(g => g.purity === purity)?.retailPrice ?? 0
-}
-// 建议价：标签价→售价；变金价→克重×金价+销售工费，四舍五入到元（JMP同款口径）
-function suggestPrice(l: SaleLine): number {
-  if (l.mode === '标签价') return l.price
-  const fee = (l.saleFeeMode === '按件') ? (l.saleFee ?? 0) : l.weightG * (l.saleFee ?? 0)
-  return Math.round(l.weightG * goldRateOf(l.purity) + fee)
-}
-function slModeChanged(l: SaleLine) {
-  l.soldPrice = suggestPrice(l)
-}
-function slAdd() {
-  const bc = slInput.value.trim().toUpperCase()
-  if (!bc) return
-  if (slLines.value.some(x => x.barcode === bc)) {
-    errMsg.value = `条码 ${bc} 已在本单中`
-    return
-  }
-  const it = items.value.find(x => x.barcode === bc)
-  if (!it) {
-    errMsg.value = `条码 ${bc} 不在当前库存列表中`
-    return
-  }
-  if (it.status !== '在库') {
-    errMsg.value = it.status === '销售中' || it.status === '退库中'
-      ? `条码 ${bc} 当前「${it.status}」（被某张草稿占着）——先处理那张草稿，或换一件`
-      : `条码 ${bc} 当前状态「${it.status}」，不能销售`
-    return
-  }
-  // 默认结算方式：有标签价用标签价，否则变金价
-  const mode = (it.price ?? 0) > 0 ? '标签价' : '变金价'
-  const line: SaleLine = {
-    barcode: bc, name: it.name, purity: it.purity,
-    weightG: it.weightG, price: it.price ?? 0, mode, soldPrice: null,
-    saleFeeMode: it.saleFeeMode || '按克', saleFee: it.saleFee ?? 0,
-  }
-  line.soldPrice = suggestPrice(line)
-  if (mode === '变金价' && goldRateOf(it.purity) <= 0) {
-    errMsg.value = `成色「${it.purity}」今日未发布金价——请先发布金价或改用标签价`
-  } else {
-    errMsg.value = ''
-  }
-  slLines.value.push(line)
-  slInput.value = ''
-}
-function slRemove(i: number) {
-  slLines.value.splice(i, 1)
-}
-const slTotal = () => slLines.value.reduce((s2, l) => s2 + (Number(l.soldPrice) || 0), 0)
-
-async function slSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.saleSave({
-      id: slEditingId.value,
-      salespersonIds: slSalespersonIds.value,
-      // 完全空白的收款行（没选方式）不上传；选了方式的原样上传让服务端把关
-      payments: slPays.value
-        .filter(p => p.method)
-        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
-      oldLines: slOld.value.filter(o => (Number(o.weightG) || 0) > 0)
-        .map(o => ({ category: o.category, purity: o.purity, weightG: Number(o.weightG) })),
-      lines: slLines.value.map(l => ({
-        barcode: l.barcode, mode: l.mode, soldPrice: Number(l.soldPrice) || 0,
-      })),
-    })
-    const id = slEditingId.value || r.id
-    if (!slEditingId.value) {
-      slEditingId.value = r.id
-      slEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      const c = await api.saleConfirm(id)
-      flash(`已收款确认：${slEditingNo.value}，合计 ¥${c.totalAmount}`)
-      slReset()
-    } else {
-      flash(`销售草稿已保存：${slEditingNo.value}`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function slConfirmDoc(d: SDoc) {
-  errMsg.value = ''
-  try {
-    const c = await api.saleConfirm(d.id)
-    flash(`已收款确认：${d.docNo}，合计 ¥${c.totalAmount}`)
-    if (slEditingId.value === d.id) slReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function slUnconfirmDoc(d: SDoc) {
-  errMsg.value = ''
-  try {
-    await api.saleUnconfirm(d.id)
-    flash(`销售已反确认：${d.docNo}，货品回到在库`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function slDeleteDoc(d: SDoc) {
-  errMsg.value = ''
-  try {
-    await api.saleDelete(d.id)
-    flash(`销售草稿 ${d.docNo} 已删除`)
-    if (slEditingId.value === d.id) slReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function slEdit(d: SDoc) {
-  slEditingId.value = d.id
-  slEditingNo.value = d.docNo
-  slLines.value = d.lines.map(l => ({ ...l }))
-  slSalespersonIds.value = [...(d.salespersonIds ?? [])]
-  slPays.value = (d.payments ?? []).map(p => ({ ...p }))
-  slOld.value = (d.oldLines ?? []).map(o => ({ category: o.category, purity: o.purity, weightG: o.weightG }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
-
 // ===== 分销商与调拨单（v0.18） =====
 interface Distributor {
   id: number
@@ -520,121 +312,6 @@ interface TDoc {
   madeAt: string
 }
 const tdocs = ref<TDoc[]>([])
-const tfEditingId = ref(0)
-const tfEditingNo = ref('')
-const tfFrom = ref(0) // 0=总库
-const tfTo = ref(0)
-const tfInput = ref('')
-const tfBarcodes = ref<{ barcode: string; name: string; location: string }[]>([])
-
-function tfReset() {
-  tfEditingId.value = 0
-  tfEditingNo.value = ''
-  tfFrom.value = 0
-  tfTo.value = 0
-  tfInput.value = ''
-  tfBarcodes.value = []
-}
-function tfLocName(id: number): string {
-  if (!id) return '总库'
-  return distributors.value.find(d => d.id === id)?.name ?? '?'
-}
-function tfAdd() {
-  const bc = tfInput.value.trim().toUpperCase()
-  if (!bc) return
-  if (tfBarcodes.value.some(x => x.barcode === bc)) {
-    errMsg.value = `条码 ${bc} 已在本单中`
-    return
-  }
-  const it = items.value.find(x => x.barcode === bc)
-  if (it) {
-    if (it.status !== '在库') {
-      errMsg.value = `条码 ${bc} 当前状态「${it.status}」，不能调拨`
-      return
-    }
-    if ((it.location ?? '总库') !== tfLocName(tfFrom.value)) {
-      errMsg.value = `条码 ${bc} 在「${it.location}」处，不在调出方「${tfLocName(tfFrom.value)}」`
-      return
-    }
-  }
-  // 不在当前列表里（可能被筛选条件滤掉了）也允许先加——保存时服务端把关
-  tfBarcodes.value.push({ barcode: bc, name: it?.name ?? '', location: it?.location ?? '' })
-  tfInput.value = ''
-  errMsg.value = ''
-}
-function tfRemove(i: number) {
-  tfBarcodes.value.splice(i, 1)
-}
-async function tfSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.transferSave({
-      id: tfEditingId.value,
-      fromDistributorId: tfFrom.value,
-      toDistributorId: tfTo.value,
-      barcodes: tfBarcodes.value.map(x => x.barcode),
-    })
-    const id = tfEditingId.value || r.id
-    if (!tfEditingId.value) {
-      tfEditingId.value = r.id
-      tfEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      await api.transferConfirm(id)
-      flash(`调拨已确认：${tfEditingNo.value}（${tfLocName(tfFrom.value)} → ${tfLocName(tfTo.value)}）`)
-      tfReset()
-    } else {
-      flash(`调拨草稿已保存：${tfEditingNo.value}`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function tfConfirmDoc(d: TDoc) {
-  errMsg.value = ''
-  try {
-    await api.transferConfirm(d.id)
-    flash(`调拨已确认：${d.docNo}`)
-    if (tfEditingId.value === d.id) tfReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function tfUnconfirmDoc(d: TDoc) {
-  errMsg.value = ''
-  try {
-    await api.transferUnconfirm(d.id)
-    flash(`调拨已反确认：${d.docNo}，货品拉回「${d.fromName}」待处理`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function tfDeleteDoc(d: TDoc) {
-  errMsg.value = ''
-  try {
-    await api.transferDelete(d.id)
-    flash(`调拨草稿 ${d.docNo} 已删除`)
-    if (tfEditingId.value === d.id) tfReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function tfEdit(d: TDoc) {
-  tfEditingId.value = d.id
-  tfEditingNo.value = d.docNo
-  tfFrom.value = d.fromDistributorId || 0
-  tfTo.value = d.toDistributorId || 0
-  tfBarcodes.value = d.lines.map(l => ({ barcode: l.barcode, name: l.name, location: '' }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
-
 // ===== 提成报表（仅管理员，v0.21） =====
 interface CommRow {
   salespersonId: number
@@ -678,121 +355,6 @@ interface HDoc {
   madeAt: string
 }
 const hdocs = ref<HDoc[]>([])
-const hsEditingId = ref(0)
-const hsEditingNo = ref('')
-const hsLines = ref<SlOld[]>([])
-const hsSalespersonIds = ref<number[]>([])
-const hsPays = ref<PayLine[]>([])
-
-function hsReset() {
-  hsEditingId.value = 0
-  hsEditingNo.value = ''
-  hsLines.value = []
-  hsSalespersonIds.value = []
-  hsPays.value = []
-}
-function hsAddLine() {
-  hsLines.value.push({
-    category: enabledCats()[0]?.name ?? '',
-    purity: enabledPurities()[0]?.name ?? '',
-    weightG: null,
-  })
-}
-function hsRemoveLine(i: number) {
-  hsLines.value.splice(i, 1)
-}
-const hsTotal = () => hsLines.value.reduce(
-  (s2, o) => s2 + (Number(o.weightG) || 0) * recycleRateOf(o.purity), 0)
-const hsPayTotal = () => hsPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
-function hsToggleSp(id: number) {
-  const i = hsSalespersonIds.value.indexOf(id)
-  if (i >= 0) hsSalespersonIds.value.splice(i, 1)
-  else if (hsSalespersonIds.value.length < 3) hsSalespersonIds.value.push(id)
-  else errMsg.value = '售货员最多3人'
-}
-function hsAddPay() {
-  const used = new Set(hsPays.value.map(p => p.method))
-  const next = enabledPayMethods().find(m => !used.has(m.name))
-  hsPays.value.push({ method: next?.name ?? '', amount: null })
-}
-function hsRemovePay(i: number) {
-  hsPays.value.splice(i, 1)
-}
-function hsFillPay(p: PayLine) {
-  const others = hsPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
-  p.amount = Math.round((hsTotal() - others) * 100) / 100
-}
-async function hsSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.recycleSave({
-      id: hsEditingId.value,
-      salespersonIds: hsSalespersonIds.value,
-      payments: hsPays.value.filter(p => p.method)
-        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
-      lines: hsLines.value.filter(o => (Number(o.weightG) || 0) > 0)
-        .map(o => ({ category: o.category, purity: o.purity, weightG: Number(o.weightG) })),
-    })
-    const id = hsEditingId.value || r.id
-    if (!hsEditingId.value) {
-      hsEditingId.value = r.id
-      hsEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      const c = await api.recycleConfirm(id)
-      flash(`回收已确认：${hsEditingNo.value}，付顾客 ¥${c.payout}`)
-      hsReset()
-    } else {
-      flash(`回收草稿已保存：${hsEditingNo.value}`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function hsConfirmDoc(d: HDoc) {
-  errMsg.value = ''
-  try {
-    const c = await api.recycleConfirm(d.id)
-    flash(`回收已确认：${d.docNo}，付顾客 ¥${c.payout}`)
-    if (hsEditingId.value === d.id) hsReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function hsUnconfirmDoc(d: HDoc) {
-  errMsg.value = ''
-  try {
-    await api.recycleUnconfirm(d.id)
-    flash(`回收已反确认：${d.docNo}`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-async function hsDeleteDoc(d: HDoc) {
-  errMsg.value = ''
-  try {
-    await api.recycleDelete(d.id)
-    flash(`回收草稿 ${d.docNo} 已删除`)
-    if (hsEditingId.value === d.id) hsReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function hsEdit(d: HDoc) {
-  hsEditingId.value = d.id
-  hsEditingNo.value = d.docNo
-  hsLines.value = d.lines.map(o => ({ category: o.category, purity: o.purity, weightG: o.weightG }))
-  hsSalespersonIds.value = [...(d.salespersonIds ?? [])]
-  hsPays.value = (d.payments ?? []).map(p => ({ ...p }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
-
 // ===== 盘点单（v0.23） =====
 interface STRow {
   barcode: string
@@ -820,103 +382,6 @@ interface PDoc {
   madeAt: string
 }
 const pdocs = ref<PDoc[]>([])
-const stEditingId = ref(0)
-const stEditingNo = ref('')
-const stLoc = ref(0)
-const stInput = ref('')
-const stScans = ref<{ barcode: string; name: string }[]>([])
-const stShowDetail = ref(0) // 展开结果详情的单据id
-
-function stReset() {
-  stEditingId.value = 0
-  stEditingNo.value = ''
-  stLoc.value = userStoreId.value
-  stInput.value = ''
-  stScans.value = []
-}
-function stAdd() {
-  const bc = stInput.value.trim().toUpperCase()
-  if (!bc) return
-  if (stScans.value.some(x => x.barcode === bc)) {
-    stInput.value = '' // 重复扫到静默忽略——盘点时扫两遍很正常
-    return
-  }
-  const it = items.value.find(x => x.barcode === bc)
-  stScans.value.push({ barcode: bc, name: it?.name ?? '' })
-  stInput.value = ''
-  errMsg.value = ''
-}
-function stRemove(i: number) {
-  stScans.value.splice(i, 1)
-}
-async function stSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.stocktakeSave({
-      id: stEditingId.value,
-      distributorId: stLoc.value,
-      barcodes: stScans.value.map(x => x.barcode),
-    })
-    const id = stEditingId.value || r.id
-    if (!stEditingId.value) {
-      stEditingId.value = r.id
-      stEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      const c = await api.stocktakeConfirm(id)
-      flash(`盘点已确认：${stEditingNo.value}——正常${c.normal} / 盘亏${c.loss} / 盘盈${c.gain}`)
-      stShowDetail.value = id
-      stReset()
-    } else {
-      flash(`盘点草稿已保存：${stEditingNo.value}（已扫${stScans.value.length}件）`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-async function stConfirmDoc(d: PDoc) {
-  errMsg.value = ''
-  try {
-    const c = await api.stocktakeConfirm(d.id)
-    flash(`盘点已确认：${d.docNo}——正常${c.normal} / 盘亏${c.loss} / 盘盈${c.gain}`)
-    stShowDetail.value = d.id
-    if (stEditingId.value === d.id) stReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function stUnconfirmDoc(d: PDoc) {
-  errMsg.value = ''
-  try {
-    await api.stocktakeUnconfirm(d.id)
-    flash(`盘点已反确认：${d.docNo}，可继续补扫后重新确认`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-async function stDeleteDoc(d: PDoc) {
-  errMsg.value = ''
-  try {
-    await api.stocktakeDelete(d.id)
-    flash(`盘点草稿 ${d.docNo} 已删除`)
-    if (stEditingId.value === d.id) stReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function stEdit(d: PDoc) {
-  stEditingId.value = d.id
-  stEditingNo.value = d.docNo
-  stLoc.value = d.distributorId || 0
-  stScans.value = d.scans.map(x => ({ ...x }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
-
 // ===== 销退单（v0.17） =====
 interface SRLine {
   barcode: string
@@ -938,123 +403,6 @@ interface RDoc {
   madeAt: string
 }
 const srdocs = ref<RDoc[]>([])
-const srEditingId = ref(0)
-const srEditingNo = ref('')
-const srLines = ref<SRLine[]>([])
-const srInput = ref('')
-const srPays = ref<PayLine[]>([])
-
-function srReset() {
-  srEditingId.value = 0
-  srEditingNo.value = ''
-  srLines.value = []
-  srInput.value = ''
-  srPays.value = []
-}
-async function srAdd() {
-  const bc = srInput.value.trim().toUpperCase()
-  if (!bc) return
-  if (srLines.value.some(x => x.barcode === bc)) {
-    errMsg.value = `条码 ${bc} 已在本单中`
-    return
-  }
-  try {
-    const r = await api.saleReturnLookup(bc)
-    srLines.value.push({ ...r })
-    srInput.value = ''
-    errMsg.value = ''
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function srRemove(i: number) {
-  srLines.value.splice(i, 1)
-}
-const srTotal = () => srLines.value.reduce((s2, l) => s2 + (Number(l.refundPrice) || 0), 0)
-const srPayTotal = () => srPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
-function srAddPay() {
-  const used = new Set(srPays.value.map(p => p.method))
-  const next = enabledPayMethods().find(m => !used.has(m.name))
-  srPays.value.push({ method: next?.name ?? '', amount: null })
-}
-function srRemovePay(i: number) {
-  srPays.value.splice(i, 1)
-}
-function srFillPay(p: PayLine) {
-  const others = srPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
-  p.amount = Math.round((srTotal() - others) * 100) / 100
-}
-async function srSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.saleReturnSave({
-      id: srEditingId.value,
-      payments: srPays.value.filter(p => p.method)
-        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
-      lines: srLines.value.map(l => ({
-        barcode: l.barcode, refundPrice: Number(l.refundPrice) || 0,
-      })),
-    })
-    const id = srEditingId.value || r.id
-    if (!srEditingId.value) {
-      srEditingId.value = r.id
-      srEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      const c = await api.saleReturnConfirm(id)
-      flash(`销退已确认：${srEditingNo.value}，退款合计 ¥${c.totalAmount}`)
-      srReset()
-    } else {
-      flash(`销退草稿已保存：${srEditingNo.value}`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function srConfirmDoc(d: RDoc) {
-  errMsg.value = ''
-  try {
-    const c = await api.saleReturnConfirm(d.id)
-    flash(`销退已确认：${d.docNo}，退款合计 ¥${c.totalAmount}`)
-    if (srEditingId.value === d.id) srReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function srUnconfirmDoc(d: RDoc) {
-  errMsg.value = ''
-  try {
-    await api.saleReturnUnconfirm(d.id)
-    flash(`销退已反确认：${d.docNo}`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function srDeleteDoc(d: RDoc) {
-  errMsg.value = ''
-  try {
-    await api.saleReturnDelete(d.id)
-    flash(`销退草稿 ${d.docNo} 已删除，货品回到"已售"`)
-    if (srEditingId.value === d.id) srReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function srEdit(d: RDoc) {
-  srEditingId.value = d.id
-  srEditingNo.value = d.docNo
-  srLines.value = d.lines.map(l => ({ ...l }))
-  srPays.value = (d.payments ?? []).map(p => ({ ...p }))
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
-
 // ===== 退库单 =====
 interface ODoc {
   id: number
@@ -1065,113 +413,100 @@ interface ODoc {
   madeAt: string
 }
 const odocs = ref<ODoc[]>([])
-const obEditingId = ref(0)
-const obEditingNo = ref('')
-const obSupplier = ref('')
-const obBarcodes = ref<string[]>([])
-const obInput = ref('')
+// ===== 工作台快捷操作（v0.32）=====
+// 预览区的 确认/反确认/删除/导出标签：小事不用开页签。完整编辑走单据页签。
+async function quickAct(fn: () => Promise<string>) {
+  errMsg.value = ''
+  try {
+    flash(await fn())
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+  await refreshAll()
+}
+const ibConfirmDoc = (d: Doc) => quickAct(async () => { const c = await api.inboundConfirm(d.id); return `已确认：${c.docNo}，生成 ${c.items.length} 件货品` })
+const ibUnconfirmDoc = (d: Doc) => quickAct(async () => { await api.inboundUnconfirm(d.id); return `已反确认：${d.docNo} 退回草稿，货品已撤回` })
+const ibDeleteDoc = (d: Doc) => quickAct(async () => { await api.inboundDelete(d.id); return `草稿 ${d.docNo} 已删除（单号不回收）` })
+async function ibExportLabels(d: Doc) {
+  errMsg.value = ''
+  try {
+    await downloadFile(`/api/doc/inbound/labels?id=${d.id}`, `标签数据-${d.docNo}.xlsx`)
+    flash(`标签数据已导出：${d.docNo}——在 Label Matrix 里把数据源指向该文件即可打印`)
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+const obConfirmDoc = (d: ODoc) => quickAct(async () => { await api.outboundConfirm(d.id); return `退库已确认：${d.docNo}` })
+const obUnconfirmDoc = (d: ODoc) => quickAct(async () => { await api.outboundUnconfirm(d.id); return `退库已反确认：${d.docNo}，货品已回到在库` })
+const obDeleteDoc = (d: ODoc) => quickAct(async () => { await api.outboundDelete(d.id); return `退库草稿 ${d.docNo} 已删除` })
+const tfConfirmDoc = (d: TDoc) => quickAct(async () => { await api.transferConfirm(d.id); return `调拨已确认：${d.docNo}` })
+const tfUnconfirmDoc = (d: TDoc) => quickAct(async () => { await api.transferUnconfirm(d.id); return `调拨已反确认：${d.docNo}，货品拉回「${d.fromName}」待处理` })
+const tfDeleteDoc = (d: TDoc) => quickAct(async () => { await api.transferDelete(d.id); return `调拨草稿 ${d.docNo} 已删除` })
+const slConfirmDoc = (d: SDoc) => quickAct(async () => { const c = await api.saleConfirm(d.id); return `已收款确认：${d.docNo}，合计 ¥${c.totalAmount}` })
+const slUnconfirmDoc = (d: SDoc) => quickAct(async () => { await api.saleUnconfirm(d.id); return `销售已反确认：${d.docNo}，货品回到在库` })
+const slDeleteDoc = (d: SDoc) => quickAct(async () => { await api.saleDelete(d.id); return `销售草稿 ${d.docNo} 已删除` })
+const srConfirmDoc = (d: RDoc) => quickAct(async () => { const c = await api.saleReturnConfirm(d.id); return `销退已确认：${d.docNo}，退款合计 ¥${c.totalAmount}` })
+const srUnconfirmDoc = (d: RDoc) => quickAct(async () => { await api.saleReturnUnconfirm(d.id); return `销退已反确认：${d.docNo}` })
+const srDeleteDoc = (d: RDoc) => quickAct(async () => { await api.saleReturnDelete(d.id); return `销退草稿 ${d.docNo} 已删除，货品回到"已售"` })
+const hsConfirmDoc = (d: HDoc) => quickAct(async () => { const c = await api.recycleConfirm(d.id); return `回收已确认：${d.docNo}，付顾客 ¥${c.payout}` })
+const hsUnconfirmDoc = (d: HDoc) => quickAct(async () => { await api.recycleUnconfirm(d.id); return `回收已反确认：${d.docNo}` })
+const hsDeleteDoc = (d: HDoc) => quickAct(async () => { await api.recycleDelete(d.id); return `回收草稿 ${d.docNo} 已删除` })
+const stConfirmDoc = (d: PDoc) => quickAct(async () => { const c = await api.stocktakeConfirm(d.id); return `盘点已确认：${d.docNo}——正常${c.normal} / 盘亏${c.loss} / 盘盈${c.gain}` })
+const stUnconfirmDoc = (d: PDoc) => quickAct(async () => { await api.stocktakeUnconfirm(d.id); return `盘点已反确认：${d.docNo}，可继续补扫后重新确认` })
+const stDeleteDoc = (d: PDoc) => quickAct(async () => { await api.stocktakeDelete(d.id); return `盘点草稿 ${d.docNo} 已删除` })
 
-function obReset() {
-  obEditingId.value = 0
-  obEditingNo.value = ''
-  obSupplier.value = ''
-  obBarcodes.value = []
-  obInput.value = ''
-}
-// 扫码/输入条码后回车或点添加：本地先查库存给出即时反馈，保存时服务端再校验
-function obAdd() {
-  const bc = obInput.value.trim().toUpperCase()
-  if (!bc) return
-  if (obBarcodes.value.includes(bc)) {
-    errMsg.value = `条码 ${bc} 已在本单中`
-    return
-  }
-  const it = items.value.find(x => x.barcode === bc)
-  if (!it) {
-    errMsg.value = `条码 ${bc} 不在库存列表中（保存时以服务端校验为准）`
-  } else if (it.status !== '在库') {
-    errMsg.value = it.status === '销售中' || it.status === '退库中'
-      ? `条码 ${bc} 当前「${it.status}」（被某张草稿占着）——先处理那张草稿`
-      : `条码 ${bc} 当前状态「${it.status}」，不能退库`
-    return
-  } else {
-    errMsg.value = ''
-  }
-  obBarcodes.value.push(bc)
-  obInput.value = ''
-}
-function obItemOf(bc: string) {
-  return items.value.find(x => x.barcode === bc)
-}
-function obRemove(i: number) {
-  obBarcodes.value.splice(i, 1)
-}
-async function obSave(confirmAfter: boolean) {
-  errMsg.value = ''
-  try {
-    const r = await api.outboundSave({
-      id: obEditingId.value,
-      supplier: obSupplier.value,
-      barcodes: obBarcodes.value,
-    })
-    const id = obEditingId.value || r.id
-    if (!obEditingId.value) {
-      obEditingId.value = r.id
-      obEditingNo.value = r.docNo
-    }
-    if (confirmAfter) {
-      await api.outboundConfirm(id)
-      flash(`退库已确认：${obEditingNo.value}`)
-      obReset()
-    } else {
-      flash(`退库草稿已保存：${obEditingNo.value}`)
-    }
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function obConfirmDoc(d: ODoc) {
-  errMsg.value = ''
-  try {
-    await api.outboundConfirm(d.id)
-    flash(`退库已确认：${d.docNo}`)
-    if (obEditingId.value === d.id) obReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function obUnconfirmDoc(d: ODoc) {
-  errMsg.value = ''
-  try {
-    await api.outboundUnconfirm(d.id)
-    flash(`退库已反确认：${d.docNo}，货品已回到在库`)
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-    await refreshAll()
-  }
-}
-async function obDeleteDoc(d: ODoc) {
-  errMsg.value = ''
-  try {
-    await api.outboundDelete(d.id)
-    flash(`退库草稿 ${d.docNo} 已删除`)
-    if (obEditingId.value === d.id) obReset()
-    await refreshAll()
-  } catch (e) {
-    errMsg.value = (e as Error).message
-  }
-}
-function obEdit(d: ODoc) {
-  obEditingId.value = d.id
-  obEditingNo.value = d.docNo
-  obSupplier.value = d.supplier
-  obBarcodes.value = d.items.map(it => it.barcode)
-}
+// ===== 工作台概览列（v0.32）：每个模块一张"列清单"，骨架是同一个 DocWorkbench =====
+interface WbCol { label: string; get: (d: any) => string | number; mono?: boolean }
+const sumItemsW = (arr?: { weightG?: number }[]) => (arr ?? []).reduce((a, x) => a + (x.weightG ?? 0), 0)
+const ibCols: WbCol[] = [
+  { label: '入库单号', get: d => d.docNo, mono: true },
+  { label: '首饰大类', get: d => d.category },
+  { label: '入库时间', get: d => d.madeAt },
+  { label: '件数', get: d => d.items?.length ?? 0 },
+  { label: '总重(g)', get: d => sumItemsW(d.items).toFixed(2) },
+  { label: '制单人', get: d => d.madeBy || '—' },
+]
+const obCols: WbCol[] = [
+  { label: '退库单号', get: d => d.docNo, mono: true },
+  { label: '退往供应商', get: d => d.supplier || '—' },
+  { label: '时间', get: d => d.madeAt },
+  { label: '件数', get: d => d.items?.length ?? 0 },
+  { label: '总重(g)', get: d => sumItemsW(d.items).toFixed(2) },
+]
+const tfCols: WbCol[] = [
+  { label: '调拨单号', get: d => d.docNo, mono: true },
+  { label: '调出 → 调入', get: d => `${d.fromName} → ${d.toName}` },
+  { label: '时间', get: d => d.madeAt },
+  { label: '件数', get: d => d.lines?.length ?? 0 },
+  { label: '总重(g)', get: d => sumItemsW(d.lines).toFixed(2) },
+]
+const slCols: WbCol[] = [
+  { label: '销售单号', get: d => d.docNo, mono: true },
+  { label: '时间', get: d => d.madeAt },
+  { label: '件数', get: d => d.lines?.length ?? 0 },
+  { label: '净额(¥)', get: d => d.totalAmount ? `${d.totalAmount < 0 ? '退 ' : ''}${Math.abs(d.totalAmount).toFixed(2)}` : '—' },
+  { label: '旧料(g)', get: d => d.oldLines?.length ? d.oldLines.reduce((a: number, o: any) => a + (o.weightG || 0), 0).toFixed(2) : '—' },
+  { label: '售货员', get: d => d.salespersonName || '—' },
+]
+const srCols: WbCol[] = [
+  { label: '销退单号', get: d => d.docNo, mono: true },
+  { label: '时间', get: d => d.madeAt },
+  { label: '件数', get: d => d.lines?.length ?? 0 },
+  { label: '退款(¥)', get: d => d.totalAmount > 0 ? d.totalAmount.toFixed(2) : '—' },
+]
+const hsCols: WbCol[] = [
+  { label: '回收单号', get: d => d.docNo, mono: true },
+  { label: '时间', get: d => d.madeAt },
+  { label: '行数', get: d => d.lines?.length ?? 0 },
+  { label: '付顾客(¥)', get: d => d.payout > 0 ? d.payout.toFixed(2) : '—' },
+  { label: '经手', get: d => d.salespersonName || '—' },
+]
+const stCols: WbCol[] = [
+  { label: '盘点单号', get: d => d.docNo, mono: true },
+  { label: '位置', get: d => d.locName },
+  { label: '时间', get: d => d.madeAt },
+  { label: '结果', get: d => d.result ? `正常${d.result.normal} / 亏${d.result.loss} / 盈${d.result.gain}` : `已扫 ${d.scans?.length ?? 0} 件` },
+]
 
 // ===== 基础资料字典 =====
 interface DictItem {
@@ -1899,604 +1234,275 @@ async function refreshAll() {
       </section>
 
       <template v-if="page==='sale'">
-
-      <!-- 销售开单 -->
-      <section class="card">
-        <h2>
-          {{ slEditingId ? `编辑销售草稿 ${slEditingNo}` : '销售开单' }}
-          <button v-if="slEditingId" class="mini" @click="slReset">放弃编辑，新建</button>
-        </h2>
-        <div class="row">
-          <label>条码 <input v-model="slInput" placeholder="扫码或输入后回车" @keyup.enter="slAdd" class="mono" /></label>
-          <button class="mini" @click="slAdd">添加</button>
-        </div>
-        <table v-if="slLines.length">
-          <thead>
-            <tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>克重</th><th>标签价</th><th>结算方式</th><th>参考价</th><th>实售价(¥)</th><th></th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="(l, i) in slLines" :key="l.barcode">
-              <td>{{ i + 1 }}</td>
-              <td class="mono">{{ l.barcode }}</td>
-              <td>{{ l.name }}</td>
-              <td>{{ l.purity }}</td>
-              <td>{{ l.weightG.toFixed(2) }}g</td>
-              <td>{{ l.price > 0 ? '¥' + l.price.toFixed(0) : '—' }}</td>
-              <td>
-                <select v-model="l.mode" @change="slModeChanged(l)">
-                  <option :disabled="l.price <= 0">标签价</option>
-                  <option>变金价</option>
-                </select>
-              </td>
-              <td class="hint">¥{{ suggestPrice(l).toFixed(2) }}<span v-if="l.mode === '变金价'">（{{ l.weightG.toFixed(2) }}g × {{ goldRateOf(l.purity).toFixed(2) }}）</span></td>
-              <td><input v-model.number="l.soldPrice" type="number" step="0.01" style="width:110px" /></td>
-              <td><button class="mini" @click="slRemove(i)">移除</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <!-- 旧料区（v0.24 以旧换新/旧料回收）：金换金银换银，额度=本单同大类新品克重 -->
-        <template v-if="slLines.length">
-          <div class="row" v-for="(o, i) in slOld" :key="i">
-            <label>旧料大类
-              <select v-model="o.category">
-                <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
-              </select>
-            </label>
-            <label>成色
-              <select v-model="o.purity">
-                <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
-              </select>
-            </label>
-            <label>克重 <input v-model.number="o.weightG" type="number" step="0.01" style="width:90px" /></label>
-            <span class="hint" v-if="(Number(o.weightG) || 0) > 0">
-              换新 {{ slOldSplit()[i].tradeG.toFixed(2) }}g×{{ tradeRateOf(o.purity).toFixed(0) }}
-              + 回收 {{ slOldSplit()[i].recycleG.toFixed(2) }}g×{{ recycleRateOf(o.purity).toFixed(0) }}
-              = 抵 ¥{{ slOldSplit()[i].credit.toFixed(2) }}
+        <DocWorkbench title="销售单" :docs="sdocs" :columns="slCols" create-label="销售开单"
+          @refresh="refreshAll" @open="d => openDocTab('saleDoc', d)" @create="openNewDocTab('saleDoc')">
+          <template #headinfo="{ doc }">
+            <span class="hint" v-if="doc.payments?.length">
+              {{ doc.payments.map((p: any) => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
             </span>
-            <button class="mini danger" @click="slRemoveOld(i)">移除</button>
-          </div>
-          <div class="row">
-            <button class="mini" @click="slAddOld">+ 顾客带旧料（以旧换新/回收）</button>
-          </div>
-        </template>
-
-        <!-- 售货员（1~3人，点名字选中，整单平分）+ 组合收款 -->
-        <div class="row" v-if="slLines.length">
-          <span>售货员(可多选，整单平分)：</span>
-          <button v-for="s in saleSalespersons()" :key="s.id" class="mini"
-            :style="slSalespersonIds.includes(s.id) ? 'background:#2f7d4f' : ''"
-            @click="slToggleSp(s.id)">
-            {{ s.name }}{{ s.role === '店长' ? '(店长)' : '' }}
-          </button>
-          <span class="hint" v-if="!saleSalespersons().length">（先在"售货员"里给{{ userStore || '总部' }}添加人员）</span>
-        </div>
-        <template v-if="slLines.length">
-          <div class="row" v-for="(p, i) in slPays" :key="i">
-            <label>收款方式
-              <select v-model="p.method">
-                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
-              </select>
-            </label>
-            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
-            <button class="mini" @click="slFillPay(p)">补足</button>
-            <button class="mini danger" @click="slRemovePay(i)">移除</button>
-          </div>
-          <div class="row">
-            <button class="mini" @click="slAddPay">+ 添加收款方式</button>
-            <span class="hint" v-if="slPays.length">
-              {{ slNet() >= 0 ? '已收' : '已退' }} ¥{{ slPayTotal().toFixed(2) }} /
-              {{ slNet() >= 0 ? '净应收' : '应退顾客' }} ¥{{ Math.abs(slNet()).toFixed(2) }}
-              <b v-if="Math.abs(slPayTotal() - Math.abs(slNet())) > 0.005" style="color:#c0392b">（差 ¥{{ (Math.abs(slNet()) - slPayTotal()).toFixed(2) }}）</b>
-              <b v-else style="color:#2f7d4f">✓ 两讫</b>
-            </span>
-          </div>
-        </template>
-        <div class="row" v-if="slLines.length">
-          <p class="ok" style="margin:0">
-            货款 ¥{{ slTotal().toFixed(2) }}
-            <template v-if="slCredit() > 0"> − 旧料抵扣 ¥{{ slCredit().toFixed(2) }} =
-              <b :style="slNet() < 0 ? 'color:#c0392b' : ''">{{ slNet() >= 0 ? '净应收' : '应退顾客' }} ¥{{ Math.abs(slNet()).toFixed(2) }}</b>
-            </template>
-          </p>
-          <span class="spacer"></span>
-          <button class="gray" @click="slSave(false)">保存草稿(挂单)</button>
-          <button @click="slSave(true)">确认收款</button>
-        </div>
-        <p class="hint">标签价=按货品售价；变金价=克重×该成色今日零售金价。实售价可在参考价上议价修改。</p>
-      </section>
-
-      <!-- 销售单列表 -->
-      <section class="card" v-if="sdocs.length">
-        <h2>销售单列表（{{ sdocs.length }} 张）</h2>
-        <div v-for="d in sdocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span class="ok" v-if="d.totalAmount !== 0">{{ d.totalAmount < 0 ? '退 ' : '' }}¥{{ Math.abs(d.totalAmount).toFixed(2) }}</span>
-            <span class="hint" v-if="d.oldLines?.length">
-              旧料 {{ d.oldLines.reduce((s2, o) => s2 + (o.weightG || 0), 0).toFixed(2) }}g
-              {{ d.oldLines.some(o => o.credit) ? '抵 ¥' + d.oldLines.reduce((s2, o) => s2 + (o.credit || 0), 0).toFixed(2) : '' }}
-            </span>
-            <span v-if="d.salespersonName">售货员：{{ d.salespersonName }}</span>
-            <span class="hint" v-if="d.payments?.length">
-              {{ d.payments.map(p => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
-            </span>
-            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="slEdit(d)">取单</button>
-              <button class="mini" @click="slConfirmDoc(d)">确认收款</button>
-              <button class="mini danger" @click="slDeleteDoc(d)">删除</button>
+          </template>
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('saleDoc', doc)">取单</button>
+              <button class="mini" @click="slConfirmDoc(doc)">确认收款</button>
+              <button class="mini danger" @click="slDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini danger" @click="slUnconfirmDoc(d)">反确认(限当日)</button>
+              <button class="mini" @click="openDocTab('saleDoc', doc)">打开</button>
+              <button class="mini danger" @click="slUnconfirmDoc(doc)">反确认(限当日)</button>
             </template>
-          </div>
-          <table v-if="d.lines?.length">
-            <tbody>
-              <tr v-for="(l, j) in d.lines" :key="j">
-                <td class="mono" style="width:150px">{{ l.barcode }}</td>
-                <td>{{ l.name }}</td>
-                <td style="width:90px">{{ l.mode }}</td>
-                <td style="width:110px">¥{{ Number(l.soldPrice ?? 0).toFixed(2) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>条码</th><th>名称</th><th>结算方式</th><th>实售价(¥)</th></tr></thead>
+              <tbody>
+                <tr v-for="(l, j) in doc.lines" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td class="mono">{{ l.barcode }}</td>
+                  <td>{{ l.name }}</td>
+                  <td>{{ l.mode }}</td>
+                  <td>¥{{ Number(l.soldPrice ?? 0).toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='transfer'">
-
-      <!-- 调拨单（v0.18） -->
-      <section v-if="isHQ" class="card">
-        <h2>
-          {{ tfEditingId ? `编辑调拨草稿 ${tfEditingNo}` : '调拨单（分货/退总库/互调）' }}
-          <button v-if="tfEditingId" class="mini" @click="tfReset">放弃，新建</button>
-        </h2>
-        <div class="row">
-          <label>调出方
-            <select v-model.number="tfFrom">
-              <option :value="0">总库</option>
-              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
-            </select>
-          </label>
-          <span>→</span>
-          <label>调入方
-            <select v-model.number="tfTo">
-              <option :value="0">总库</option>
-              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
-            </select>
-          </label>
-          <label>条码 <input v-model="tfInput" placeholder="扫码或输入后回车" @keyup.enter="tfAdd" class="mono" /></label>
-          <button class="mini" @click="tfAdd">添加</button>
-        </div>
-        <table v-if="tfBarcodes.length">
-          <thead>
-            <tr><th>#</th><th>条码</th><th>名称</th><th></th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="(x, i) in tfBarcodes" :key="x.barcode">
-              <td>{{ i + 1 }}</td>
-              <td class="mono">{{ x.barcode }}</td>
-              <td>{{ x.name || '—' }}</td>
-              <td><button class="mini" @click="tfRemove(i)">删行</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <div class="row" v-if="tfBarcodes.length">
-          <p class="ok" style="margin:0">共 {{ tfBarcodes.length }} 件：{{ tfLocName(tfFrom) }} → {{ tfLocName(tfTo) }}</p>
-          <span class="spacer"></span>
-          <button class="gray" @click="tfSave(false)">保存草稿</button>
-          <button @click="tfSave(true)">确认调拨</button>
-        </div>
-        <p class="hint">同一张单覆盖三种用法：总库→分销商＝分货；分销商→总库＝退回；分销商→分销商＝互调。草稿即占用（调拨中）。</p>
-      </section>
-
-      <!-- 调拨单列表 -->
-      <section class="card" v-if="isHQ && tdocs.length">
-        <h2>调拨单列表（{{ tdocs.length }} 张）</h2>
-        <div v-for="d in tdocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span>{{ d.fromName }} → {{ d.toName }}</span>
-            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="tfEdit(d)">编辑</button>
-              <button class="mini" @click="tfConfirmDoc(d)">确认调拨</button>
-              <button class="mini danger" @click="tfDeleteDoc(d)">删除</button>
+        <DocWorkbench v-if="isHQ" title="调拨单（分货/退总库/互调）" :docs="tdocs" :columns="tfCols" create-label="新建调拨单"
+          @refresh="refreshAll" @open="d => openDocTab('transferDoc', d)" @create="openNewDocTab('transferDoc')">
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('transferDoc', doc)">打开编辑</button>
+              <button class="mini" @click="tfConfirmDoc(doc)">确认调拨</button>
+              <button class="mini danger" @click="tfDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini danger" @click="tfUnconfirmDoc(d)">反确认</button>
+              <button class="mini" @click="openDocTab('transferDoc', doc)">打开</button>
+              <button class="mini danger" @click="tfUnconfirmDoc(doc)">反确认</button>
             </template>
-          </div>
-          <table v-if="d.lines?.length">
-            <tbody>
-              <tr v-for="(l, j) in d.lines" :key="j">
-                <td class="mono" style="width:160px">{{ l.barcode }}</td>
-                <td>{{ l.name }}</td>
-                <td style="width:110px">{{ l.purity }}</td>
-                <td style="width:90px">{{ (l.weightG ?? 0).toFixed(2) }}g</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>重量(g)</th></tr></thead>
+              <tbody>
+                <tr v-for="(l, j) in doc.lines" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td class="mono">{{ l.barcode }}</td>
+                  <td>{{ l.name }}</td>
+                  <td>{{ l.purity }}</td>
+                  <td>{{ (l.weightG ?? 0).toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='recycle'">
-
-      <!-- 纯旧料回收单（v0.25） -->
-      <section class="card">
-        <h2>
-          {{ hsEditingId ? `编辑回收草稿 ${hsEditingNo}` : '旧料回收（顾客卖料给店里）' }}
-          <button v-if="hsEditingId" class="mini" @click="hsReset">放弃，新建</button>
-        </h2>
-        <div class="row" v-for="(o, i) in hsLines" :key="i">
-          <label>大类
-            <select v-model="o.category">
-              <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
-            </select>
-          </label>
-          <label>成色
-            <select v-model="o.purity">
-              <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
-            </select>
-          </label>
-          <label>克重 <input v-model.number="o.weightG" type="number" step="0.01" style="width:90px" /></label>
-          <span class="hint" v-if="(Number(o.weightG) || 0) > 0">
-            × 回收价 {{ recycleRateOf(o.purity).toFixed(2) }} = ¥{{ ((Number(o.weightG) || 0) * recycleRateOf(o.purity)).toFixed(2) }}
-          </span>
-          <button class="mini danger" @click="hsRemoveLine(i)">移除</button>
-        </div>
-        <div class="row">
-          <button class="mini" @click="hsAddLine">+ 添加旧料</button>
-        </div>
-        <template v-if="hsLines.length">
-          <div class="row">
-            <span>经手售货员(可多选)：</span>
-            <button v-for="s in saleSalespersons()" :key="s.id" class="mini"
-              :style="hsSalespersonIds.includes(s.id) ? 'background:#2f7d4f' : ''"
-              @click="hsToggleSp(s.id)">
-              {{ s.name }}{{ s.role === '店长' ? '(店长)' : '' }}
-            </button>
-          </div>
-          <div class="row" v-for="(p, i) in hsPays" :key="i">
-            <label>付款方式
-              <select v-model="p.method">
-                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
-              </select>
-            </label>
-            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
-            <button class="mini" @click="hsFillPay(p)">补足</button>
-            <button class="mini danger" @click="hsRemovePay(i)">移除</button>
-          </div>
-          <div class="row">
-            <button class="mini" @click="hsAddPay">+ 添加付款方式</button>
-            <span class="hint" v-if="hsPays.length">
-              已付 ¥{{ hsPayTotal().toFixed(2) }} / 应付顾客 ¥{{ hsTotal().toFixed(2) }}
-              <b v-if="Math.abs(hsPayTotal() - hsTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (hsTotal() - hsPayTotal()).toFixed(2) }}）</b>
-              <b v-else style="color:#2f7d4f">✓ 两讫</b>
-            </span>
-          </div>
-          <div class="row">
-            <p class="ok" style="margin:0">应付顾客：¥{{ hsTotal().toFixed(2) }}</p>
-            <span class="spacer"></span>
-            <button class="gray" @click="hsSave(false)">保存草稿</button>
-            <button @click="hsSave(true)">确认付款</button>
-          </div>
-        </template>
-        <p class="hint">全部按当日回收价折算（确认时快照）；回收提成按"旧料回收"规则入账；反确认限当日。旧料暂不入库存（旧料库待做）。</p>
-      </section>
-
-      <!-- 回收单列表 -->
-      <section class="card" v-if="hdocs.length">
-        <h2>回收单列表（{{ hdocs.length }} 张）</h2>
-        <div v-for="d in hdocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span class="ok" v-if="d.payout > 0">付 ¥{{ d.payout.toFixed(2) }}</span>
-            <span v-if="d.salespersonName">经手：{{ d.salespersonName }}</span>
-            <span class="hint">{{ (d.lines?.length ?? 0) }} 行 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="hsEdit(d)">取单</button>
-              <button class="mini" @click="hsConfirmDoc(d)">确认付款</button>
-              <button class="mini danger" @click="hsDeleteDoc(d)">删除</button>
+        <DocWorkbench title="回收单" :docs="hdocs" :columns="hsCols" create-label="新建回收单"
+          @refresh="refreshAll" @open="d => openDocTab('recycleDoc', d)" @create="openNewDocTab('recycleDoc')">
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('recycleDoc', doc)">取单</button>
+              <button class="mini" @click="hsConfirmDoc(doc)">确认付款</button>
+              <button class="mini danger" @click="hsDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini danger" @click="hsUnconfirmDoc(d)">反确认(限当日)</button>
+              <button class="mini" @click="openDocTab('recycleDoc', doc)">打开</button>
+              <button class="mini danger" @click="hsUnconfirmDoc(doc)">反确认(限当日)</button>
             </template>
-          </div>
-          <table v-if="d.lines?.length">
-            <tbody>
-              <tr v-for="(o, j) in d.lines" :key="j">
-                <td style="width:120px">{{ o.category }}</td>
-                <td style="width:140px">{{ o.purity }}</td>
-                <td style="width:100px">{{ (o.weightG ?? 0).toFixed(2) }}g</td>
-                <td>{{ o.recyclePrice ? `×${o.recyclePrice.toFixed(2)} = ¥${(o.credit ?? 0).toFixed(2)}` : '—' }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>大类</th><th>成色</th><th>克重(g)</th><th>折算</th></tr></thead>
+              <tbody>
+                <tr v-for="(o, j) in doc.lines" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td>{{ o.category }}</td>
+                  <td>{{ o.purity }}</td>
+                  <td>{{ (o.weightG ?? 0).toFixed(2) }}</td>
+                  <td>{{ o.recyclePrice ? `×${o.recyclePrice.toFixed(2)} = ¥${(o.credit ?? 0).toFixed(2)}` : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='saleReturn'">
-
-      <!-- 销退单（v0.17） -->
-      <section class="card">
-        <h2>
-          {{ srEditingId ? `编辑销退草稿 ${srEditingNo}` : '销退单（退货）' }}
-          <button v-if="srEditingId" class="mini" @click="srReset">放弃，新建</button>
-        </h2>
-        <div class="row">
-          <label>条码 <input v-model="srInput" placeholder="扫已售件的条码后回车" @keyup.enter="srAdd" class="mono" /></label>
-          <button class="mini" @click="srAdd">添加</button>
-        </div>
-        <table v-if="srLines.length">
-          <thead>
-            <tr><th>条码</th><th>名称</th><th>原销售单</th><th>原成交价</th><th>退款金额(可下调)</th><th></th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="(l, i) in srLines" :key="l.barcode">
-              <td class="mono">{{ l.barcode }}</td>
-              <td>{{ l.name }}</td>
-              <td class="mono">{{ l.origDocNo }}</td>
-              <td>¥{{ (l.soldPrice ?? 0).toFixed(2) }}</td>
-              <td><input v-model.number="l.refundPrice" type="number" step="0.01" style="width:110px" /></td>
-              <td><button class="mini" @click="srRemove(i)">删行</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <template v-if="srLines.length">
-          <div class="row" v-for="(p, i) in srPays" :key="i">
-            <label>退款方式
-              <select v-model="p.method">
-                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
-              </select>
-            </label>
-            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
-            <button class="mini" @click="srFillPay(p)">补足</button>
-            <button class="mini danger" @click="srRemovePay(i)">移除</button>
-          </div>
-          <div class="row">
-            <button class="mini" @click="srAddPay">+ 添加退款方式</button>
-            <span class="hint" v-if="srPays.length">
-              已退 ¥{{ srPayTotal().toFixed(2) }} / 应退 ¥{{ srTotal().toFixed(2) }}
-              <b v-if="Math.abs(srPayTotal() - srTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (srTotal() - srPayTotal()).toFixed(2) }}）</b>
-              <b v-else style="color:#2f7d4f">✓ 两讫</b>
+        <DocWorkbench title="销退单" :docs="srdocs" :columns="srCols" create-label="新建销退单"
+          @refresh="refreshAll" @open="d => openDocTab('saleReturnDoc', d)" @create="openNewDocTab('saleReturnDoc')">
+          <template #headinfo="{ doc }">
+            <span class="hint" v-if="doc.payments?.length">
+              {{ doc.payments.map((p: any) => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
             </span>
-          </div>
-          <div class="row">
-            <p class="ok" style="margin:0">应退合计：¥{{ srTotal().toFixed(2) }}</p>
-            <span class="spacer"></span>
-            <button class="gray" @click="srSave(false)">保存草稿</button>
-            <button @click="srSave(true)">确认退款</button>
-          </div>
-        </template>
-        <p class="hint">只收"已售"的件；退款不能超过原成交价；反确认限当日。</p>
-      </section>
-
-      <!-- 销退单列表 -->
-      <section class="card" v-if="srdocs.length">
-        <h2>销退单列表（{{ srdocs.length }} 张）</h2>
-        <div v-for="d in srdocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span class="ok" v-if="d.totalAmount > 0">退 ¥{{ d.totalAmount.toFixed(2) }}</span>
-            <span class="hint" v-if="d.payments?.length">
-              {{ d.payments.map(p => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}
-            </span>
-            <span class="hint">{{ (d.lines?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="srEdit(d)">取单</button>
-              <button class="mini" @click="srConfirmDoc(d)">确认退款</button>
-              <button class="mini danger" @click="srDeleteDoc(d)">删除</button>
+          </template>
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('saleReturnDoc', doc)">取单</button>
+              <button class="mini" @click="srConfirmDoc(doc)">确认退款</button>
+              <button class="mini danger" @click="srDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini danger" @click="srUnconfirmDoc(d)">反确认(限当日)</button>
+              <button class="mini" @click="openDocTab('saleReturnDoc', doc)">打开</button>
+              <button class="mini danger" @click="srUnconfirmDoc(doc)">反确认(限当日)</button>
             </template>
-          </div>
-          <table v-if="d.lines?.length">
-            <tbody>
-              <tr v-for="(l, j) in d.lines" :key="j">
-                <td class="mono" style="width:150px">{{ l.barcode }}</td>
-                <td>{{ l.name }}</td>
-                <td class="mono" style="width:150px">原单 {{ l.origDocNo }}</td>
-                <td style="width:110px">退 ¥{{ Number(l.refundPrice ?? 0).toFixed(2) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>条码</th><th>名称</th><th>原销售单</th><th>退款(¥)</th></tr></thead>
+              <tbody>
+                <tr v-for="(l, j) in doc.lines" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td class="mono">{{ l.barcode }}</td>
+                  <td>{{ l.name }}</td>
+                  <td class="mono">{{ l.origDocNo }}</td>
+                  <td>¥{{ Number(l.refundPrice ?? 0).toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='inbound'">
-        <!-- 入库工作台（v0.31）：上=单据概览(单击预览/双击取单)，下=明细预览 -->
-        <InboundList v-if="isHQ" :docs="docs" :dicts="dicts"
-          @refresh="refreshAll" @flash="flash"
-          @open="openInboundDoc" @create="openInboundNew" @imported="onImported" />
+        <DocWorkbench v-if="isHQ" title="入库单" :docs="docs" :columns="ibCols" create-label="新建入库单"
+          @refresh="refreshAll" @open="d => openDocTab('inboundDoc', d)" @create="openNewDocTab('inboundDoc')">
+          <template #headinfo="{ doc }">
+            <span class="hint">{{ doc.category }} · {{ sumItemsW(doc.items).toFixed(2) }}g</span>
+          </template>
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('inboundDoc', doc)">打开编辑</button>
+              <button class="mini" @click="ibConfirmDoc(doc)">确认</button>
+              <button class="mini danger" @click="ibDeleteDoc(doc)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini" @click="openDocTab('inboundDoc', doc)">打开</button>
+              <button class="mini" @click="ibExportLabels(doc)">导出标签</button>
+              <button class="mini danger" @click="ibUnconfirmDoc(doc)">反确认</button>
+            </template>
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>条码号</th><th>首饰名称</th><th>成色</th><th>克重(g)</th><th>售价(¥)</th></tr></thead>
+              <tbody>
+                <tr v-for="(it, j) in doc.items" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td class="mono">{{ it.barcode || '(待发号)' }}</td>
+                  <td>{{ it.name }}</td>
+                  <td>{{ it.purity }}</td>
+                  <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
+                  <td>{{ (it.price ?? 0).toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
-      <!-- 入库单据页签（v0.31）：v-show 保活，可同开多张单互不丢编辑状态 -->
+      <!-- 单据页签（v0.31入库首发，v0.32七种通用）：v-show 保活，可同开多张单互不丢编辑状态 -->
       <template v-for="t in tabs" :key="t.id">
         <InboundDoc v-if="t.kind === 'inboundDoc'" v-show="activeTabId === t.id"
-          :doc-id="t.docId ?? 0" :initial="docInitials[t.id] ?? null"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null"
           :dicts="dicts" :is-admin="isAdmin"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <OutboundDoc v-if="t.kind === 'outboundDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null" :items="items"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <TransferDoc v-if="t.kind === 'transferDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null"
+          :items="items" :distributors="distributors"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <SaleDoc v-if="t.kind === 'saleDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null"
+          :items="items" :gold-prices="goldPrices" :salespersons="saleSalespersons()"
+          :dicts="dicts" :user-store="userStore"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <SaleReturnDoc v-if="t.kind === 'saleReturnDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null" :dicts="dicts"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <RecycleDoc v-if="t.kind === 'recycleDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null"
+          :dicts="dicts" :gold-prices="goldPrices" :salespersons="saleSalespersons()"
+          @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
+          @rename="(sNew) => renameTab(t.id, sNew)" />
+        <StocktakeDoc v-if="t.kind === 'stocktakeDoc'" v-show="activeTabId === t.id"
+          :doc-id="t.docId ?? 0" :initial="(docInitials[t.id] as any) ?? null"
+          :items="items" :distributors="distributors"
+          :is-h-q="isHQ" :user-store-id="userStoreId" :user-store="userStore"
           @close="closeTab(t.id)" @refresh="refreshAll" @flash="flash"
           @rename="(sNew) => renameTab(t.id, sNew)" />
       </template>
 
       <template v-if="page==='outbound'">
-
-      <!-- 退库单 -->
-      <section v-if="isHQ" class="card">
-        <h2>
-          {{ obEditingId ? `编辑退库草稿 ${obEditingNo}` : '新建退库单' }}
-          <button v-if="obEditingId" class="mini" @click="obReset">放弃编辑，新建</button>
-        </h2>
-        <div class="row">
-          <label>退往供应商 <input v-model="obSupplier" placeholder="选填" /></label>
-          <label>条码 <input v-model="obInput" placeholder="扫码或输入后回车" @keyup.enter="obAdd" class="mono" /></label>
-          <button class="mini" @click="obAdd">添加</button>
-        </div>
-        <table v-if="obBarcodes.length">
-          <thead><tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>重量(g)</th><th></th></tr></thead>
-          <tbody>
-            <tr v-for="(bc, i) in obBarcodes" :key="bc">
-              <td>{{ i + 1 }}</td>
-              <td class="mono">{{ bc }}</td>
-              <td>{{ obItemOf(bc)?.name || '?' }}</td>
-              <td>{{ obItemOf(bc)?.purity || '?' }}</td>
-              <td>{{ (obItemOf(bc)?.weightG ?? 0).toFixed(2) }}</td>
-              <td><button class="mini" @click="obRemove(i)">移除</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <div class="row" v-if="obBarcodes.length">
-          <button class="gray" @click="obSave(false)">保存草稿</button>
-          <button @click="obSave(true)">保存并确认退库</button>
-        </div>
-        <p class="hint">确认后货品状态变为"已退库"；退过库的货品会阻止其入库单反确认（下游校验）。</p>
-      </section>
-
-      <!-- 退库单列表 -->
-      <section class="card" v-if="isHQ && odocs.length">
-        <h2>退库单列表（{{ odocs.length }} 张）</h2>
-        <div v-for="d in odocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span>{{ d.supplier || '—' }}</span>
-            <span class="hint">{{ (d.items?.length ?? 0) }} 件 · {{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="obEdit(d)">编辑</button>
-              <button class="mini" @click="obConfirmDoc(d)">确认</button>
-              <button class="mini danger" @click="obDeleteDoc(d)">删除</button>
+        <DocWorkbench v-if="isHQ" title="退库单" :docs="odocs" :columns="obCols" create-label="新建退库单"
+          @refresh="refreshAll" @open="d => openDocTab('outboundDoc', d)" @create="openNewDocTab('outboundDoc')">
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('outboundDoc', doc)">打开编辑</button>
+              <button class="mini" @click="obConfirmDoc(doc)">确认</button>
+              <button class="mini danger" @click="obDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini danger" @click="obUnconfirmDoc(d)">反确认</button>
+              <button class="mini" @click="openDocTab('outboundDoc', doc)">打开</button>
+              <button class="mini danger" @click="obUnconfirmDoc(doc)">反确认</button>
             </template>
-          </div>
-          <table v-if="d.items?.length">
-            <tbody>
-              <tr v-for="(it, j) in d.items" :key="j">
-                <td class="mono" style="width:160px">{{ it.barcode }}</td>
-                <td>{{ it.name }}</td>
-                <td style="width:110px">{{ it.purity }}</td>
-                <td style="width:90px">{{ (it.weightG ?? 0).toFixed(2) }}g</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
+          </template>
+          <template #preview="{ doc }">
+            <table>
+              <thead><tr><th>#</th><th>条码</th><th>名称</th><th>成色</th><th>重量(g)</th></tr></thead>
+              <tbody>
+                <tr v-for="(it, j) in doc.items" :key="j">
+                  <td>{{ j + 1 }}</td>
+                  <td class="mono">{{ it.barcode }}</td>
+                  <td>{{ it.name }}</td>
+                  <td>{{ it.purity }}</td>
+                  <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='stocktake'">
-
-      <!-- 盘点单（v0.23） -->
-      <section class="card">
-        <h2>
-          {{ stEditingId ? `编辑盘点草稿 ${stEditingNo}` : '盘点' }}
-          <button v-if="stEditingId" class="mini" @click="stReset">放弃，新建</button>
-        </h2>
-        <div class="row">
-          <label v-if="isHQ">盘点位置
-            <select v-model.number="stLoc">
-              <option :value="0">总库</option>
-              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
-            </select>
-          </label>
-          <span v-else>盘点位置：{{ userStore }}</span>
-          <label>条码 <input v-model="stInput" placeholder="逐件扫码后回车" @keyup.enter="stAdd" class="mono" /></label>
-          <button class="mini" @click="stAdd">添加</button>
-          <span class="ok" v-if="stScans.length">已扫 {{ stScans.length }} 件</span>
-        </div>
-        <table v-if="stScans.length">
-          <tbody>
-            <tr v-for="(x, i) in stScans" :key="x.barcode">
-              <td style="width:40px">{{ i + 1 }}</td>
-              <td class="mono" style="width:160px">{{ x.barcode }}</td>
-              <td>{{ x.name || '—' }}</td>
-              <td style="width:70px"><button class="mini" @click="stRemove(i)">删行</button></td>
-            </tr>
-          </tbody>
-        </table>
-        <div class="row" v-if="stScans.length">
-          <span class="spacer"></span>
-          <button class="gray" @click="stSave(false)">保存草稿(明天接着盘)</button>
-          <button @click="stSave(true)">完成盘点(对账)</button>
-        </div>
-        <p class="hint">只收系统存在过的条码；重复扫自动去重。确认那一刻对账：账面应在没扫到=盘亏；扫到了但账面不在此位置=盘盈（自动带出关联单据）。盘点不改库存——处理差异走各自的业务单据。</p>
-      </section>
-
-      <!-- 盘点单列表 -->
-      <section class="card" v-if="pdocs.length">
-        <h2>盘点单列表（{{ pdocs.length }} 张）</h2>
-        <div v-for="d in pdocs" :key="d.id" class="doc">
-          <div class="dochead">
-            <span class="mono">{{ d.docNo }}</span>
-            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span>{{ d.locName }}</span>
-            <template v-if="d.result">
-              <span class="ok">正常 {{ d.result.normal }}</span>
-              <span :style="d.result.loss ? 'color:#c0392b;font-weight:bold' : ''">盘亏 {{ d.result.loss }}</span>
-              <span :style="d.result.gain ? 'color:#b8860b;font-weight:bold' : ''">盘盈 {{ d.result.gain }}</span>
-            </template>
-            <span class="hint" v-else>已扫 {{ d.scans?.length ?? 0 }} 件</span>
-            <span class="hint">{{ d.madeAt }}</span>
-            <span class="spacer"></span>
-            <template v-if="d.status === '草稿'">
-              <button class="mini" @click="stEdit(d)">继续盘</button>
-              <button class="mini" @click="stConfirmDoc(d)">完成盘点</button>
-              <button class="mini danger" @click="stDeleteDoc(d)">删除</button>
+        <DocWorkbench title="盘点单" :docs="pdocs" :columns="stCols" create-label="新建盘点单"
+          @refresh="refreshAll" @open="d => openDocTab('stocktakeDoc', d)" @create="openNewDocTab('stocktakeDoc')">
+          <template #actions="{ doc }">
+            <template v-if="doc.status === '草稿'">
+              <button class="mini" @click="openDocTab('stocktakeDoc', doc)">继续盘</button>
+              <button class="mini" @click="stConfirmDoc(doc)">完成盘点</button>
+              <button class="mini danger" @click="stDeleteDoc(doc)">删除</button>
             </template>
             <template v-else>
-              <button class="mini" @click="stShowDetail = stShowDetail === d.id ? 0 : d.id">
-                {{ stShowDetail === d.id ? '收起' : '差异详情' }}
-              </button>
-              <button class="mini danger" @click="stUnconfirmDoc(d)">反确认(重盘)</button>
+              <button class="mini" @click="openDocTab('stocktakeDoc', doc)">差异详情</button>
+              <button class="mini danger" @click="stUnconfirmDoc(doc)">反确认(重盘)</button>
             </template>
-          </div>
-          <template v-if="d.result && stShowDetail === d.id">
-            <table v-if="d.result.lossList?.length">
-              <thead><tr><th colspan="3" style="color:#c0392b">盘亏（账面应在、实物没扫到）</th></tr></thead>
-              <tbody>
-                <tr v-for="x in d.result.lossList" :key="x.barcode">
-                  <td class="mono" style="width:160px">{{ x.barcode }}</td>
-                  <td>{{ x.name }}</td>
-                  <td style="width:110px">账面「{{ x.status }}」</td>
-                </tr>
-              </tbody>
-            </table>
-            <table v-if="d.result.gainList?.length">
-              <thead><tr><th colspan="4" style="color:#b8860b">盘盈（扫到了、账面不在此位置）</th></tr></thead>
-              <tbody>
-                <tr v-for="x in d.result.gainList" :key="x.barcode">
-                  <td class="mono" style="width:160px">{{ x.barcode }}</td>
-                  <td>{{ x.name }}</td>
-                  <td style="width:150px">账面「{{ x.status }}」@{{ x.location }}</td>
-                  <td class="mono" style="width:150px">{{ x.refDocNo ? '关联 ' + x.refDocNo : '—' }}</td>
-                </tr>
-              </tbody>
-            </table>
-            <p class="hint" v-if="!d.result.lossList?.length && !d.result.gainList?.length">账实完全一致，没有差异。</p>
           </template>
-        </div>
-      </section>
-
+          <template #preview="{ doc }">
+            <table v-if="doc.status === '草稿'">
+              <tbody>
+                <tr v-for="(x, j) in doc.scans" :key="j">
+                  <td style="width:40px">{{ j + 1 }}</td>
+                  <td class="mono" style="width:160px">{{ x.barcode }}</td>
+                  <td>{{ x.name || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else-if="doc.result" class="hint" style="padding:8px">
+              正常 {{ doc.result.normal }} / 盘亏 {{ doc.result.loss }} / 盘盈 {{ doc.result.gain }}（实扫 {{ doc.result.scanned }} 件）
+              ——双击或点"差异详情"打开单据页看明细。
+            </p>
+          </template>
+        </DocWorkbench>
       </template>
 
       <template v-if="page==='inventory'">
@@ -2715,6 +1721,12 @@ td input { width: 100%; box-sizing: border-box; border: 1px solid #ddd; }
 table.pick tbody tr { cursor: pointer; }
 table.pick tbody tr:hover { background: #f5f7f3; }
 table.pick tbody tr.sel { background: #fcf4de; }
+
+/* --- Excel导入列名映射面板（v0.32） --- */
+.impmap {
+  border: 1px solid #ecd9a6; background: #fdfaf0; border-radius: 6px;
+  padding: 8px 12px; margin: 8px 0;
+}
 
 /* --- 规划中的空页面 --- */
 .placeholder {

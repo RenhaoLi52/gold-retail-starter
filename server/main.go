@@ -4988,7 +4988,70 @@ func readXLSXFirstSheet(data []byte) ([][]string, error) {
 	return out, nil
 }
 
+// POST /api/import/preview —— 上传 xlsx，只解析不入库，返回 表头+数据行（v0.32）。
+// 这是"列名映射导入"的第一步：真实表格的列名不一定与我们的属性名一致，
+// 前端拿到表头后让用户确认一次映射（同名自动配上，配不上的手选），
+// 确认后把行追加进单据表单——保存/确认时走与手工录入完全相同的校验。
+func handleImportPreview(w http.ResponseWriter, r *http.Request) {
+	if !requireHQ(w, r) {
+		return
+	}
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeErr(w, 400, "上传解析失败: "+err.Error())
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 400, "没有收到文件")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 10<<20))
+	if err != nil {
+		writeErr(w, 500, "读取文件失败: "+err.Error())
+		return
+	}
+	table, err := readXLSXFirstSheet(data)
+	if err != nil {
+		writeErr(w, 400, err.Error()+"——请上传 .xlsx 文件（旧 .xls 请先在 Excel 里另存为 .xlsx）")
+		return
+	}
+	if len(table) < 2 {
+		writeErr(w, 400, "文件里没有数据行（第一行是表头，数据从第二行开始）")
+		return
+	}
+	headers := table[0]
+	// 去掉全空行；行长补齐到表头长度，前端按列号取值不越界
+	rows := [][]string{}
+	for _, row := range table[1:] {
+		empty := true
+		for _, c := range row {
+			if strings.TrimSpace(c) != "" {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			continue
+		}
+		for len(row) < len(headers) {
+			row = append(row, "")
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) == 0 {
+		writeErr(w, 400, "文件里没有数据行（第一行是表头，数据从第二行开始）")
+		return
+	}
+	if len(rows) > 500 {
+		writeErr(w, 400, fmt.Sprintf("一次最多导入 500 行（文件里有 %d 行数据），请分批", len(rows)))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"headers": headers, "rows": rows, "count": len(rows)})
+}
+
 // POST /api/doc/inbound/import —— 多部件上传(file+category)；校验全过才建一张草稿
+// （v0.32 起前端改走 /api/import/preview + 表单追加，此接口保留兼容、界面不再使用）
 func handleInboundImport(w http.ResponseWriter, r *http.Request) {
 	if !requireHQ(w, r) {
 		return
@@ -5702,6 +5765,7 @@ func main() {
 	mux.HandleFunc("GET /api/doc/inbound/labels", withAuth(handleInboundLabels))
 	mux.HandleFunc("GET /api/doc/inbound/import-template", withAuth(handleImportTemplate))
 	mux.HandleFunc("POST /api/doc/inbound/import", withAuth(handleInboundImport))
+	mux.HandleFunc("POST /api/import/preview", withAuth(handleImportPreview))
 	mux.HandleFunc("POST /api/doc/outbound/save", withAuth(handleOutboundSave))
 	mux.HandleFunc("POST /api/doc/outbound/confirm", withAuth(handleOutboundConfirm))
 	mux.HandleFunc("POST /api/doc/outbound/unconfirm", withAuth(handleOutboundUnconfirm))

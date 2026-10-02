@@ -3,7 +3,7 @@
 // 状态全在组件内部——因此可以同时开多张单据页签互不串数据（这是从 App.vue
 // 全局表单搬出来成组件的根本原因）。
 import { computed, onMounted, ref } from 'vue'
-import { api, downloadFile } from '../api'
+import { api, downloadFile, uploadFile } from '../api'
 
 interface DictItem { id: number; name: string; sort: number; enabled: boolean }
 interface DocItem {
@@ -198,6 +198,106 @@ async function exportLabels() {
     err.value = (e as Error).message
   }
 }
+
+// ===== Excel 导入（v0.32：列名映射 + 追加行）=====
+// 两步走：①上传文件让服务端解析出表头和数据行；②用户确认"Excel列→货品属性"
+// 的映射（列名完全相同的自动配上，配不上的手选），确认后把行【追加】到当前
+// 表格——不覆盖已手工录入的行。校验留给保存/确认时的统一通道，报错行号
+// 与表格里看到的行号一致。
+const importTargets = [
+  { key: 'barcode', label: '条码号' },
+  { key: 'purity', label: '成色' },
+  { key: 'stoneName', label: '主石名称' },
+  { key: 'jewelType', label: '首饰类别' },
+  { key: 'weightG', label: '总件重' },
+  { key: 'price', label: '售价' },
+  { key: 'saleFeeMode', label: '销售工费方式' },
+  { key: 'saleFee', label: '销售工费' },
+  { key: 'costGoldPrice', label: '进货金价' },
+  { key: 'costFeeMode', label: '进货工费方式' },
+  { key: 'costFee', label: '进货工费' },
+] as const
+const numKeys = new Set(['weightG', 'price', 'saleFee', 'costGoldPrice', 'costFee'])
+const importFileEl = ref<HTMLInputElement | null>(null)
+const imp = ref<null | { headers: string[]; rows: string[][]; map: string[] }>(null)
+
+async function downloadTemplate() {
+  err.value = ''
+  try {
+    await downloadFile('/api/doc/inbound/import-template', '入库导入模板.xlsx')
+  } catch (e) {
+    err.value = (e as Error).message
+  }
+}
+const norm = (h: string) => h.replace(/[\s\n]/g, '')
+async function pickImportFile(ev: Event) {
+  err.value = ''
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    const r = await uploadFile('/api/import/preview', file, {}) as { headers: string[]; rows: string[][] }
+    imp.value = {
+      headers: r.headers,
+      rows: r.rows,
+      // 自动映射：列名与属性名完全相同（忽略空格）就配上；配不上留空待手选
+      map: r.headers.map(h => {
+        const hit = importTargets.find(t => t.label === norm(h)
+          || t.label + '(g)' === norm(h) || t.label + '(¥)' === norm(h)) // 模板里带单位的写法也认
+        return hit?.key ?? ''
+      }),
+    }
+  } catch (e) {
+    err.value = (e as Error).message
+  }
+}
+// 同一属性被映射到两列是配置错误，提示出来
+const dupTargets = computed(() => {
+  if (!imp.value) return []
+  const seen: Record<string, number> = {}
+  for (const k of imp.value.map) if (k) seen[k] = (seen[k] ?? 0) + 1
+  return importTargets.filter(t => (seen[t.key] ?? 0) > 1).map(t => t.label)
+})
+function applyImport() {
+  if (!imp.value) return
+  err.value = ''
+  if (dupTargets.value.length) {
+    err.value = `属性「${dupTargets.value.join('、')}」被映射了多列——每个属性最多对应一列`
+    return
+  }
+  for (const need of ['purity', 'jewelType', 'weightG'] as const) {
+    if (!imp.value.map.includes(need)) {
+      err.value = `必须映射「${importTargets.find(t => t.key === need)!.label}」这一列（成色/首饰类别/总件重是必填属性）`
+      return
+    }
+  }
+  const newLines: Line[] = []
+  for (const row of imp.value.rows) {
+    const l = blankLine()
+    l.purity = '' // 导入行不吃默认成色，映射到什么就是什么
+    imp.value.map.forEach((key, i) => {
+      if (!key) return
+      const cell = (row[i] ?? '').trim()
+      if (numKeys.has(key)) {
+        ;(l as any)[key] = cell === '' ? null : Number(cell)
+      } else if (key === 'saleFeeMode' || key === 'costFeeMode') {
+        ;(l as any)[key] = cell || '按克'
+      } else {
+        ;(l as any)[key] = cell
+      }
+    })
+    newLines.push(l)
+  }
+  // 追加而不是替换：手工录到一半也能并进来；表单里尚是全空白的占位行剔掉
+  const notBlank = (l: Line) => l.barcode || l.purity || l.stoneName || l.jewelType
+    || l.weightG !== null || l.price !== null || l.saleFee !== null
+    || l.costGoldPrice !== null || l.costFee !== null
+  lines.value = [...lines.value.filter(notBlank), ...newLines]
+  if (!lines.value.length) lines.value = [blankLine()]
+  emit('flash', `已追加 ${newLines.length} 行到表格——请复核后保存`)
+  imp.value = null
+}
 </script>
 
 <template>
@@ -218,7 +318,40 @@ async function exportLabels() {
       </label>
       <span v-if="madeAt" class="hint">制单：{{ madeAt }}<template v-if="madeBy">（{{ madeBy }}）</template></span>
       <span class="spacer"></span>
+      <template v-if="editable">
+        <button class="mini" @click="downloadTemplate">下载导入模板</button>
+        <button class="mini" @click="importFileEl?.click()">Excel导入</button>
+        <input ref="importFileEl" type="file" accept=".xlsx" style="display:none" @change="pickImportFile" />
+      </template>
       <span class="hint">{{ count }} 件 · 共 {{ sumW.toFixed(2) }}g</span>
+    </div>
+
+    <!-- 列名映射确认（v0.32）：选了文件后出现，确认后把行追加进下面的表格 -->
+    <div v-if="editable && imp" class="impmap">
+      <p style="margin:4px 0"><b>确认列名映射</b>（{{ imp.rows.length }} 行数据）：
+        列名与属性完全相同的已自动配上，其余请手选；不需要的列选"忽略"。</p>
+      <table>
+        <thead><tr><th>Excel 列名</th><th>第一行示例</th><th>导入为属性</th></tr></thead>
+        <tbody>
+          <tr v-for="(h, i) in imp.headers" :key="i">
+            <td>{{ h || '（无列名）' }}</td>
+            <td class="hint">{{ imp.rows[0]?.[i] || '—' }}</td>
+            <td>
+              <select v-model="imp.map[i]">
+                <option value="">— 忽略 —</option>
+                <option v-for="t in importTargets" :key="t.key" :value="t.key">{{ t.label }}</option>
+              </select>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="dupTargets.length" class="err">属性「{{ dupTargets.join('、') }}」被映射了多列，请调整。</p>
+      <div class="row">
+        <span class="hint">成色 / 首饰类别 / 总件重 必须映射；导入是【追加】，不会清掉已录入的行。</span>
+        <span class="spacer"></span>
+        <button class="mini gray" @click="imp = null">取消</button>
+        <button class="mini" @click="applyImport">确认导入 {{ imp.rows.length }} 行</button>
+      </div>
     </div>
 
     <!-- 草稿/新单：可编辑行表格 -->
