@@ -115,6 +115,13 @@ export const api = {
   transferDelete: (id: number) => request('POST', '/api/doc/transfer/delete', { id }),
   transferList: () => request('GET', '/api/doc/transfer'),
 
+  // 盘点单（v0.23）
+  stocktakeSave: (payload: unknown) => request('POST', '/api/doc/stocktake/save', payload),
+  stocktakeConfirm: (id: number) => request('POST', '/api/doc/stocktake/confirm', { id }),
+  stocktakeUnconfirm: (id: number) => request('POST', '/api/doc/stocktake/unconfirm', { id }),
+  stocktakeDelete: (id: number) => request('POST', '/api/doc/stocktake/delete', { id }),
+  stocktakeList: () => request('GET', '/api/doc/stocktake'),
+
   // 售货员档案（读取所有人；增改仅管理员）
   salespersonList: () => request('GET', '/api/salespersons'),
   salespersonCreate: (payload: unknown) => request('POST', '/api/salespersons', payload),

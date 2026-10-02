@@ -500,6 +500,130 @@ async function loadReport() {
   }
 }
 
+// ===== 盘点单（v0.23） =====
+interface STRow {
+  barcode: string
+  name: string
+  status: string
+  location?: string
+  refDocNo?: string
+}
+interface STResult {
+  normal: number
+  loss: number
+  gain: number
+  scanned: number
+  lossList: STRow[]
+  gainList: STRow[]
+}
+interface PDoc {
+  id: number
+  docNo: string
+  status: string
+  distributorId: number
+  locName: string
+  scans: { barcode: string; name: string }[]
+  result: STResult | null
+  madeAt: string
+}
+const pdocs = ref<PDoc[]>([])
+const stEditingId = ref(0)
+const stEditingNo = ref('')
+const stLoc = ref(0)
+const stInput = ref('')
+const stScans = ref<{ barcode: string; name: string }[]>([])
+const stShowDetail = ref(0) // 展开结果详情的单据id
+
+function stReset() {
+  stEditingId.value = 0
+  stEditingNo.value = ''
+  stLoc.value = userStoreId.value
+  stInput.value = ''
+  stScans.value = []
+}
+function stAdd() {
+  const bc = stInput.value.trim().toUpperCase()
+  if (!bc) return
+  if (stScans.value.some(x => x.barcode === bc)) {
+    stInput.value = '' // 重复扫到静默忽略——盘点时扫两遍很正常
+    return
+  }
+  const it = items.value.find(x => x.barcode === bc)
+  stScans.value.push({ barcode: bc, name: it?.name ?? '' })
+  stInput.value = ''
+  errMsg.value = ''
+}
+function stRemove(i: number) {
+  stScans.value.splice(i, 1)
+}
+async function stSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.stocktakeSave({
+      id: stEditingId.value,
+      distributorId: stLoc.value,
+      barcodes: stScans.value.map(x => x.barcode),
+    })
+    const id = stEditingId.value || r.id
+    if (!stEditingId.value) {
+      stEditingId.value = r.id
+      stEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      const c = await api.stocktakeConfirm(id)
+      flash(`盘点已确认：${stEditingNo.value}——正常${c.normal} / 盘亏${c.loss} / 盘盈${c.gain}`)
+      stShowDetail.value = id
+      stReset()
+    } else {
+      flash(`盘点草稿已保存：${stEditingNo.value}（已扫${stScans.value.length}件）`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function stConfirmDoc(d: PDoc) {
+  errMsg.value = ''
+  try {
+    const c = await api.stocktakeConfirm(d.id)
+    flash(`盘点已确认：${d.docNo}——正常${c.normal} / 盘亏${c.loss} / 盘盈${c.gain}`)
+    stShowDetail.value = d.id
+    if (stEditingId.value === d.id) stReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function stUnconfirmDoc(d: PDoc) {
+  errMsg.value = ''
+  try {
+    await api.stocktakeUnconfirm(d.id)
+    flash(`盘点已反确认：${d.docNo}，可继续补扫后重新确认`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function stDeleteDoc(d: PDoc) {
+  errMsg.value = ''
+  try {
+    await api.stocktakeDelete(d.id)
+    flash(`盘点草稿 ${d.docNo} 已删除`)
+    if (stEditingId.value === d.id) stReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function stEdit(d: PDoc) {
+  stEditingId.value = d.id
+  stEditingNo.value = d.docNo
+  stLoc.value = d.distributorId || 0
+  stScans.value = d.scans.map(x => ({ ...x }))
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
 // ===== 销退单（v0.17） =====
 interface SRLine {
   barcode: string
@@ -852,14 +976,16 @@ async function saveSp(s: Salesperson) {
   }
 }
 
-// ===== 提成规则（仅管理员，v0.20） =====
+// ===== 提成规则（仅管理员，v0.20；v0.22版本化） =====
 interface CommRule {
   id: number
   category: string
   mode: string
   calcType: string
   value: number
-  enabled: boolean
+  validFrom: string
+  validTo: string
+  status: string
 }
 const commRules = ref<CommRule[]>([])
 const showRules = ref(false)
@@ -867,6 +993,7 @@ const nrCategory = ref('')
 const nrMode = ref('标签价')
 const nrCalc = ref('销售额百分比')
 const nrValue = ref<number | null>(null)
+const nrFrom = ref(new Date().toISOString().slice(0, 10))
 const calcUnit = (t: string) => t === '销售额百分比' ? '%' : t === '每克固定' ? '元/克' : '元/件'
 
 async function toggleRules() {
@@ -887,30 +1014,32 @@ async function createRule() {
     await api.commissionRuleCreate({
       category: nrCategory.value, mode: nrMode.value,
       calcType: nrCalc.value, value: Number(nrValue.value) || 0,
+      validFrom: nrFrom.value,
     })
-    flash(`提成规则已新增：${nrCategory.value}×${nrMode.value}`)
+    flash(`提成规则新版本已建立：${nrCategory.value}×${nrMode.value}，${nrFrom.value}起生效`)
     nrValue.value = null
     await loadRules()
   } catch (e) {
     errMsg.value = (e as Error).message
   }
 }
-async function saveRule(x: CommRule) {
+// 结束一个开放版本（默认今天收尾；此后该维度无提成，直到建新版本）
+async function endRule(x: CommRule) {
   errMsg.value = ''
   try {
-    await api.commissionRuleUpdate({ id: x.id, calcType: x.calcType, value: Number(x.value) || 0 })
-    flash(`规则已保存：${x.category}×${x.mode}`)
+    await api.commissionRuleUpdate({ id: x.id, validTo: new Date().toISOString().slice(0, 10) })
+    flash(`规则已结束：${x.category}×${x.mode}（今日为最后生效日）`)
     await loadRules()
   } catch (e) {
     errMsg.value = (e as Error).message
-    await loadRules()
   }
 }
-async function toggleRule(x: CommRule) {
+// 取消还没生效的排期版本
+async function cancelRule(x: CommRule) {
   errMsg.value = ''
   try {
-    await api.commissionRuleUpdate({ id: x.id, enabled: !x.enabled })
-    flash(`规则已${x.enabled ? '停用' : '启用'}`)
+    await api.commissionRuleUpdate({ id: x.id, cancel: true })
+    flash(`排期已取消：${x.category}×${x.mode}（原定${x.validFrom}生效）`)
     await loadRules()
   } catch (e) {
     errMsg.value = (e as Error).message
@@ -1095,12 +1224,13 @@ async function refreshAll() {
   if (fCategory.value) params.category = fCategory.value
   if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
   if (fLoc.value !== '') params.loc = fLoc.value
-  const [ri, rd, ro, rs, rr, rt, rdist] = await Promise.all([
+  const [ri, rd, ro, rs, rr, rt, rdist, rpd] = await Promise.all([
     api.items(params), api.inboundList(), api.outboundList(), api.saleList(), api.saleReturnList(),
-    api.transferList(), api.distributorList(),
+    api.transferList(), api.distributorList(), api.stocktakeList(),
   ])
   tdocs.value = rt.list
   distributors.value = rdist.list
+  pdocs.value = rpd.list
   items.value = ri.list
   itemsTotal.value = ri.total
   itemsSumW.value = ri.sumWeightG
@@ -1346,31 +1476,29 @@ function editDoc(d: Doc) {
         <p class="hint">每个门店最多一位启用的店长；店长从本店店员每笔提成中抽上面的百分比（店员到手=份额×(1-抽成%)），店长自己卖货按规则全额拿。改门店/角色只影响之后确认的单。</p>
       </section>
 
-      <!-- 提成规则（仅管理员可见，v0.20） -->
+      <!-- 提成规则（仅管理员可见，v0.20；v0.22版本化） -->
       <section v-if="isAdmin && showRules" class="card">
         <h2>提成规则 <button class="mini" @click="loadRules">刷新</button></h2>
         <table>
           <thead>
-            <tr><th>大类</th><th>结算方式</th><th>计算方式</th><th>数值</th><th>状态</th><th>操作</th></tr>
+            <tr><th>大类</th><th>结算方式</th><th>计算方式</th><th>数值</th><th>生效从</th><th>失效至</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="x in commRules" :key="x.id">
+            <tr v-for="x in commRules" :key="x.id" :style="x.status === '已失效' ? 'color:#999' : ''">
               <td>{{ x.category }}</td>
               <td>{{ x.mode }}</td>
+              <td>{{ x.calcType }}</td>
+              <td>{{ x.value }} {{ calcUnit(x.calcType) }}</td>
+              <td class="mono">{{ x.validFrom }}</td>
+              <td class="mono">{{ x.validTo || '—' }}</td>
               <td>
-                <select v-model="x.calcType">
-                  <option>销售额百分比</option>
-                  <option>每克固定</option>
-                  <option>每件固定</option>
-                </select>
+                <b v-if="x.status === '生效中'" style="color:#2f7d4f">生效中</b>
+                <b v-else-if="x.status === '未生效'" style="color:#b8860b">未生效</b>
+                <span v-else>已失效</span>
               </td>
-              <td><input v-model.number="x.value" type="number" step="0.1" style="width:80px" /> {{ calcUnit(x.calcType) }}</td>
-              <td>{{ x.enabled ? '启用' : '已停用' }}</td>
               <td>
-                <button class="mini" @click="saveRule(x)">保存</button>
-                <button :class="['mini', x.enabled ? 'danger' : '']" @click="toggleRule(x)">
-                  {{ x.enabled ? '停用' : '启用' }}
-                </button>
+                <button v-if="x.status === '生效中' && !x.validTo" class="mini danger" @click="endRule(x)">今日结束</button>
+                <button v-if="x.status === '未生效'" class="mini danger" @click="cancelRule(x)">取消排期</button>
               </td>
             </tr>
           </tbody>
@@ -1396,9 +1524,10 @@ function editDoc(d: Doc) {
             </select>
           </label>
           <label>数值 <input v-model.number="nrValue" type="number" step="0.1" style="width:80px" /> {{ calcUnit(nrCalc) }}</label>
-          <button @click="createRule">新增规则</button>
+          <label>生效日期 <input v-model="nrFrom" type="date" /></label>
+          <button @click="createRule">新增版本</button>
         </div>
-        <p class="hint">每个"大类×结算方式"一条规则；没配规则的货没有提成（不报错）。改规则只影响之后确认的单——已入账的提成是确认时刻的快照。</p>
+        <p class="hint">调整规则=对同一"大类×结算方式"新增一个版本，旧版本自动在新版本生效前一天关闭；生效日期可以填未来（排期）。历史版本不可修改——已入账的提成是确认时刻的快照，这里留的是"当时按什么算"的痕。没有生效版本的货没有提成（不报错）。</p>
       </section>
 
       <!-- 提成报表（仅管理员可见，v0.21） -->
@@ -1949,6 +2078,97 @@ function editDoc(d: Doc) {
               </tr>
             </tbody>
           </table>
+        </div>
+      </section>
+
+      <!-- 盘点单（v0.23） -->
+      <section class="card">
+        <h2>
+          {{ stEditingId ? `编辑盘点草稿 ${stEditingNo}` : '盘点' }}
+          <button v-if="stEditingId" class="mini" @click="stReset">放弃，新建</button>
+        </h2>
+        <div class="row">
+          <label v-if="isHQ">盘点位置
+            <select v-model.number="stLoc">
+              <option :value="0">总库</option>
+              <option v-for="d in enabledDists()" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
+          <span v-else>盘点位置：{{ userStore }}</span>
+          <label>条码 <input v-model="stInput" placeholder="逐件扫码后回车" @keyup.enter="stAdd" class="mono" /></label>
+          <button class="mini" @click="stAdd">添加</button>
+          <span class="ok" v-if="stScans.length">已扫 {{ stScans.length }} 件</span>
+        </div>
+        <table v-if="stScans.length">
+          <tbody>
+            <tr v-for="(x, i) in stScans" :key="x.barcode">
+              <td style="width:40px">{{ i + 1 }}</td>
+              <td class="mono" style="width:160px">{{ x.barcode }}</td>
+              <td>{{ x.name || '—' }}</td>
+              <td style="width:70px"><button class="mini" @click="stRemove(i)">删行</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="row" v-if="stScans.length">
+          <span class="spacer"></span>
+          <button class="gray" @click="stSave(false)">保存草稿(明天接着盘)</button>
+          <button @click="stSave(true)">完成盘点(对账)</button>
+        </div>
+        <p class="hint">只收系统存在过的条码；重复扫自动去重。确认那一刻对账：账面应在没扫到=盘亏；扫到了但账面不在此位置=盘盈（自动带出关联单据）。盘点不改库存——处理差异走各自的业务单据。</p>
+      </section>
+
+      <!-- 盘点单列表 -->
+      <section class="card" v-if="pdocs.length">
+        <h2>盘点单列表（{{ pdocs.length }} 张）</h2>
+        <div v-for="d in pdocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span>{{ d.locName }}</span>
+            <template v-if="d.result">
+              <span class="ok">正常 {{ d.result.normal }}</span>
+              <span :style="d.result.loss ? 'color:#c0392b;font-weight:bold' : ''">盘亏 {{ d.result.loss }}</span>
+              <span :style="d.result.gain ? 'color:#b8860b;font-weight:bold' : ''">盘盈 {{ d.result.gain }}</span>
+            </template>
+            <span class="hint" v-else>已扫 {{ d.scans?.length ?? 0 }} 件</span>
+            <span class="hint">{{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="stEdit(d)">继续盘</button>
+              <button class="mini" @click="stConfirmDoc(d)">完成盘点</button>
+              <button class="mini danger" @click="stDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini" @click="stShowDetail = stShowDetail === d.id ? 0 : d.id">
+                {{ stShowDetail === d.id ? '收起' : '差异详情' }}
+              </button>
+              <button class="mini danger" @click="stUnconfirmDoc(d)">反确认(重盘)</button>
+            </template>
+          </div>
+          <template v-if="d.result && stShowDetail === d.id">
+            <table v-if="d.result.lossList?.length">
+              <thead><tr><th colspan="3" style="color:#c0392b">盘亏（账面应在、实物没扫到）</th></tr></thead>
+              <tbody>
+                <tr v-for="x in d.result.lossList" :key="x.barcode">
+                  <td class="mono" style="width:160px">{{ x.barcode }}</td>
+                  <td>{{ x.name }}</td>
+                  <td style="width:110px">账面「{{ x.status }}」</td>
+                </tr>
+              </tbody>
+            </table>
+            <table v-if="d.result.gainList?.length">
+              <thead><tr><th colspan="4" style="color:#b8860b">盘盈（扫到了、账面不在此位置）</th></tr></thead>
+              <tbody>
+                <tr v-for="x in d.result.gainList" :key="x.barcode">
+                  <td class="mono" style="width:160px">{{ x.barcode }}</td>
+                  <td>{{ x.name }}</td>
+                  <td style="width:150px">账面「{{ x.status }}」@{{ x.location }}</td>
+                  <td class="mono" style="width:150px">{{ x.refDocNo ? '关联 ' + x.refDocNo : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="hint" v-if="!d.result.lossList?.length && !d.result.gainList?.length">账实完全一致，没有差异。</p>
+          </template>
         </div>
       </section>
 

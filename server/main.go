@@ -910,30 +910,37 @@ func handleSalespersonUpdate(w http.ResponseWriter, r *http.Request) {
 // 规则：大类×结算方式 唯一；三种算法三选一。
 // 台账 commission_flow 只追加：销售确认写入、销售反确认删除（当日重开）、销退确认写冲减负行。
 
-// GET /api/commission-rules —— 管理员可读（规则含比例，属敏感配置）
+// GET /api/commission-rules —— 管理员可读；返回全部版本，带派生状态（生效中/已失效/未生效）
 func handleCommissionRuleList(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
-	rows, err := db.Query(`SELECT id, category, mode, calc_type, value, enabled
-		FROM commission_rule ORDER BY category, mode`)
+	rows, err := db.Query(`SELECT id, category, mode, calc_type, value,
+		to_char(valid_from,'YYYY-MM-DD'), COALESCE(to_char(valid_to,'YYYY-MM-DD'),''),
+		CASE WHEN valid_from > CURRENT_DATE THEN '未生效'
+		     WHEN valid_to IS NOT NULL AND valid_to < CURRENT_DATE THEN '已失效'
+		     ELSE '生效中' END
+		FROM commission_rule ORDER BY category, mode, valid_from DESC`)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
 	}
 	defer rows.Close()
 	type R struct {
-		ID       int64   `json:"id"`
-		Category string  `json:"category"`
-		Mode     string  `json:"mode"`
-		CalcType string  `json:"calcType"`
-		Value    float64 `json:"value"`
-		Enabled  bool    `json:"enabled"`
+		ID        int64   `json:"id"`
+		Category  string  `json:"category"`
+		Mode      string  `json:"mode"`
+		CalcType  string  `json:"calcType"`
+		Value     float64 `json:"value"`
+		ValidFrom string  `json:"validFrom"`
+		ValidTo   string  `json:"validTo"`
+		Status    string  `json:"status"`
 	}
 	list := []R{}
 	for rows.Next() {
 		var x R
-		if err := rows.Scan(&x.ID, &x.Category, &x.Mode, &x.CalcType, &x.Value, &x.Enabled); err != nil {
+		if err := rows.Scan(&x.ID, &x.Category, &x.Mode, &x.CalcType, &x.Value,
+			&x.ValidFrom, &x.ValidTo, &x.Status); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -944,16 +951,19 @@ func handleCommissionRuleList(w http.ResponseWriter, r *http.Request) {
 
 var validCalcTypes = map[string]bool{"销售额百分比": true, "每克固定": true, "每件固定": true}
 
-// POST /api/commission-rules —— 新增规则（管理员）
+// POST /api/commission-rules —— 新增版本（管理员，v0.22）。
+// "调整规则"=对同一维度再建一个版本：旧的开放版本自动在新版本生效前一天关闭。
+// 历史版本不可修改——已入账的提成本就是快照，规则留痕让"当时按什么算的"永远可查。
 func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
 	var req struct {
-		Category string  `json:"category"`
-		Mode     string  `json:"mode"`
-		CalcType string  `json:"calcType"`
-		Value    float64 `json:"value"`
+		Category  string  `json:"category"`
+		Mode      string  `json:"mode"`
+		CalcType  string  `json:"calcType"`
+		Value     float64 `json:"value"`
+		ValidFrom string  `json:"validFrom"` // YYYY-MM-DD，空=今天
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "参数格式错误")
@@ -982,61 +992,130 @@ func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "百分比不能超过100")
 		return
 	}
-	var id int64
-	err := db.QueryRow(`INSERT INTO commission_rule (category, mode, calc_type, value)
-		VALUES ($1,$2,$3,$4) RETURNING id`, req.Category, req.Mode, req.CalcType, req.Value).Scan(&id)
+	if req.ValidFrom == "" {
+		req.ValidFrom = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", req.ValidFrom); err != nil {
+		writeErr(w, 400, "生效日期格式应为 YYYY-MM-DD")
+		return
+	}
+
+	tx, err := db.Begin()
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key") {
-			writeErr(w, 400, "该大类×结算方式已有规则——请直接修改原规则")
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	// 新版本必须晚于该维度现有最新版本的生效日（版本按生效日严格递增，区间才不重叠）
+	var latestID int64
+	var latestFrom string
+	var latestTo sql.NullString
+	err = tx.QueryRow(`SELECT id, to_char(valid_from,'YYYY-MM-DD'), to_char(valid_to,'YYYY-MM-DD')
+		FROM commission_rule WHERE category=$1 AND mode=$2
+		ORDER BY valid_from DESC, id DESC LIMIT 1 FOR UPDATE`, req.Category, req.Mode).
+		Scan(&latestID, &latestFrom, &latestTo)
+	if err != nil && err != sql.ErrNoRows {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if err == nil {
+		if latestFrom > req.ValidFrom {
+			writeErr(w, 400, fmt.Sprintf("生效日期不能早于现有最新版本的生效日（%s）", latestFrom))
 			return
 		}
+		// 旧开放版本（或失效日晚于新版本生效日的）自动关闭在新版本前一天。
+		// 同日调整（latestFrom == validFrom）：旧版本区间变空=当即作废，只留痕——
+		// 已确认单据的提成是快照，不受影响。
+		if !latestTo.Valid || latestTo.String >= req.ValidFrom {
+			if _, err := tx.Exec(`UPDATE commission_rule SET valid_to = $1::date - 1 WHERE id=$2`,
+				req.ValidFrom, latestID); err != nil {
+				writeErr(w, 500, "关闭旧版本失败: "+err.Error())
+				return
+			}
+		}
+	}
+	var id int64
+	if err := tx.QueryRow(`INSERT INTO commission_rule (category, mode, calc_type, value, valid_from)
+		VALUES ($1,$2,$3,$4,$5::date) RETURNING id`,
+		req.Category, req.Mode, req.CalcType, req.Value, req.ValidFrom).Scan(&id); err != nil {
 		writeErr(w, 500, "创建失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id})
 }
 
-// POST /api/commission-rules/update —— 改算法/数值/停用（管理员）。
-// 改规则只影响之后确认的单——已入账的提成是确认时刻的快照，不回算。
+// POST /api/commission-rules/update —— 仅两种动作（管理员，v0.22）：
+//   {id, validTo}：结束一个开放版本（此后该维度没有提成，直到建新版本）；
+//   {id, cancel:true}：取消一个还没生效的排期版本（删除）。
+// 数值/算法不可改——调整请新建版本。
 func handleCommissionRuleUpdate(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
 	var req struct {
-		ID       int64    `json:"id"`
-		CalcType *string  `json:"calcType"`
-		Value    *float64 `json:"value"`
-		Enabled  *bool    `json:"enabled"`
+		ID      int64  `json:"id"`
+		ValidTo string `json:"validTo"`
+		Cancel  bool   `json:"cancel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
 		writeErr(w, 400, "参数错误")
 		return
 	}
-	if req.CalcType != nil {
-		if !validCalcTypes[*req.CalcType] {
-			writeErr(w, 400, "计算方式必须是 销售额百分比/每克固定/每件固定")
+	if req.Cancel {
+		// 取消排期要把"被它顶掉"的上一版本重新打开——否则排期日起是无规则真空期，静默没提成
+		tx, err := db.Begin()
+		if err != nil {
+			writeErr(w, 500, "开启事务失败: "+err.Error())
 			return
 		}
-		if _, err := db.Exec(`UPDATE commission_rule SET calc_type=$1 WHERE id=$2`, *req.CalcType, req.ID); err != nil {
-			writeErr(w, 500, "更新失败: "+err.Error())
+		defer tx.Rollback()
+		var cat, mode, from string
+		err = tx.QueryRow(`DELETE FROM commission_rule WHERE id=$1 AND valid_from > CURRENT_DATE
+			RETURNING category, mode, to_char(valid_from,'YYYY-MM-DD')`, req.ID).Scan(&cat, &mode, &from)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, "只能取消还没生效的排期版本——已生效的版本请用\"结束\"关闭")
 			return
 		}
+		if err != nil {
+			writeErr(w, 500, "取消失败: "+err.Error())
+			return
+		}
+		// 上一版本若恰好结束在排期前一天（自动关闭留下的痕迹），重新打开
+		if _, err := tx.Exec(`UPDATE commission_rule SET valid_to = NULL
+			WHERE id = (SELECT id FROM commission_rule WHERE category=$1 AND mode=$2
+				AND valid_to = $3::date - 1
+				ORDER BY valid_from DESC, id DESC LIMIT 1)`, cat, mode, from); err != nil {
+			writeErr(w, 500, "恢复上一版本失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"deleted": req.ID})
+		return
 	}
-	if req.Value != nil {
-		if *req.Value <= 0 {
-			writeErr(w, 400, "数值必须大于0")
-			return
-		}
-		if _, err := db.Exec(`UPDATE commission_rule SET value=$1 WHERE id=$2`, *req.Value, req.ID); err != nil {
-			writeErr(w, 500, "更新失败: "+err.Error())
-			return
-		}
+	if req.ValidTo == "" {
+		writeErr(w, 400, "请指定失效日期")
+		return
 	}
-	if req.Enabled != nil {
-		if _, err := db.Exec(`UPDATE commission_rule SET enabled=$1 WHERE id=$2`, *req.Enabled, req.ID); err != nil {
-			writeErr(w, 500, "更新失败: "+err.Error())
-			return
-		}
+	if _, err := time.Parse("2006-01-02", req.ValidTo); err != nil {
+		writeErr(w, 400, "失效日期格式应为 YYYY-MM-DD")
+		return
+	}
+	res, err := db.Exec(`UPDATE commission_rule SET valid_to=$1::date
+		WHERE id=$2 AND valid_to IS NULL AND valid_from <= $1::date`, req.ValidTo, req.ID)
+	if err != nil {
+		writeErr(w, 500, "更新失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "结束失败：该版本不存在、已有失效日，或失效日早于生效日")
+		return
 	}
 	writeJSON(w, 200, map[string]any{"id": req.ID})
 }
@@ -1120,12 +1199,16 @@ func loadSalesperson(q rowQuerier, id int64) (spInfo, error) {
 	return s, err
 }
 
-// lineCommission 按规则算一件货的提成总额；没配规则 = 0（不报错，没规则就没提成）
+// lineCommission 按"今天生效的版本"算一件货的提成总额；没有生效版本 = 0（不报错）。
+// v0.22：规则带生效区间，取 valid_from<=今天<=valid_to(或开放) 中最新的一版。
 func lineCommission(tx *sql.Tx, category, mode string, soldPrice, weightG float64) (float64, error) {
 	var calcType string
 	var value float64
 	err := tx.QueryRow(`SELECT calc_type, value FROM commission_rule
-		WHERE category=$1 AND mode=$2 AND enabled=true`, category, mode).Scan(&calcType, &value)
+		WHERE category=$1 AND mode=$2
+		AND valid_from <= CURRENT_DATE
+		AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
+		ORDER BY valid_from DESC, id DESC LIMIT 1`, category, mode).Scan(&calcType, &value)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -3544,6 +3627,355 @@ func handleTransferList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
 }
 
+// ===== 盘点单（v0.23） =====
+// 按位置盘点；草稿只存扫到的条码（不锁定任何货品——盘点是"看"不是"占"）；
+// 确认那一刻对账生成结果快照：正常/盘亏/盘盈（盘盈带当前状态位置+最近关联单据）。
+// 确认不改库存：盘亏的货可能后续找到，盘盈揭示的问题走各自业务单据处理。
+
+type stScan struct {
+	Barcode string `json:"barcode"`
+	Name    string `json:"name"`
+}
+
+// POST /api/doc/stocktake/save {id?, distributorId, barcodes[]}
+func handleStocktakeSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID            int64    `json:"id"`
+		DistributorID int64    `json:"distributorId"` // 0=总库
+		Barcodes      []string `json:"barcodes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Barcodes) == 0 {
+		writeErr(w, 400, "参数错误：至少要有一个条码")
+		return
+	}
+	// 门店账号只能盘本店（无视客户端传什么）
+	if store := currentStore(r); store != 0 {
+		req.DistributorID = store
+	}
+	seen := map[string]bool{}
+	scans := []stScan{}
+	for i, raw := range req.Barcodes {
+		bc := strings.ToUpper(strings.TrimSpace(raw))
+		if !validBarcode(bc) {
+			writeErr(w, 400, fmt.Sprintf("第%d个条码 %s 格式非法", i+1, bc))
+			return
+		}
+		if seen[bc] {
+			continue // 重复扫到不算错，静默去重
+		}
+		seen[bc] = true
+		scans = append(scans, stScan{Barcode: bc})
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if err := checkLoc(tx, req.DistributorID, "盘点位置"); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	// 只收系统存在过的条码——不存在的条码当场报错（可能扫错/标签不是本系统的）
+	for i := range scans {
+		err := tx.QueryRow(`SELECT name FROM item WHERE barcode=$1`, scans[i].Barcode).Scan(&scans[i].Name)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("条码 %s 系统中不存在——盘点只收系统存在过的条码", scans[i].Barcode))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "查询失败: "+err.Error())
+			return
+		}
+	}
+	linesJSON, _ := json.Marshal(scans)
+
+	if req.ID == 0 {
+		today := time.Now().Format("20060102")
+		seq, err := nextSeq(tx, "PD", today)
+		if err != nil {
+			writeErr(w, 500, "单号发号失败: "+err.Error())
+			return
+		}
+		if seq > 99 {
+			writeErr(w, 400, "当日盘点单号已满99张")
+			return
+		}
+		docNo := fmt.Sprintf("PD%s%02d", today, seq)
+		var docID int64
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines, distributor_id)
+			VALUES ($1,'stocktake','草稿',$2,$3,$4) RETURNING id`,
+			docNo, currentUID(r), linesJSON, nullableID(req.DistributorID)).Scan(&docID)
+		if err != nil {
+			writeErr(w, 500, "保存失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
+		return
+	}
+	res, err := tx.Exec(`UPDATE doc SET draft_lines=$1, distributor_id=$2
+		WHERE id=$3 AND doc_type='stocktake' AND status='草稿'`,
+		linesJSON, nullableID(req.DistributorID), req.ID)
+	if err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "该单据不是草稿状态（可能已被确认或删除），请刷新")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/stocktake/confirm {id} —— 对账时刻：生成正常/盘亏/盘盈快照
+func handleStocktakeConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := tx.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='stocktake'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := tx.Exec(`UPDATE doc SET status='已确认', confirmed_at=now()
+		WHERE id=$1 AND doc_type='stocktake' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
+		return
+	}
+	var linesJSON []byte
+	var locID sql.NullInt64
+	if err := tx.QueryRow(`SELECT draft_lines, distributor_id FROM doc WHERE id=$1`,
+		req.ID).Scan(&linesJSON, &locID); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var scans []stScan
+	if err := json.Unmarshal(linesJSON, &scans); err != nil || len(scans) == 0 {
+		writeErr(w, 400, "没有扫到任何条码，无法确认")
+		return
+	}
+	scanned := map[string]bool{}
+	for _, s := range scans {
+		scanned[s.Barcode] = true
+	}
+
+	// 应在清单：账面在此位置、且没有离场（已售/已退库=实物不该在店里）
+	type stRow struct {
+		Barcode  string `json:"barcode"`
+		Name     string `json:"name"`
+		Status   string `json:"status"`
+		Location string `json:"location,omitempty"`
+		RefDocNo string `json:"refDocNo,omitempty"`
+	}
+	var erows *sql.Rows
+	if locID.Int64 == 0 {
+		erows, err = tx.Query(`SELECT barcode, name, status FROM item
+			WHERE location_type='总库' AND status NOT IN ('已售','已退库') ORDER BY id`)
+	} else {
+		erows, err = tx.Query(`SELECT barcode, name, status FROM item
+			WHERE location_type='分销商' AND distributor_id=$1 AND status NOT IN ('已售','已退库') ORDER BY id`,
+			locID.Int64)
+	}
+	if err != nil {
+		writeErr(w, 500, "应在清单查询失败: "+err.Error())
+		return
+	}
+	expected := map[string]stRow{}
+	for erows.Next() {
+		var x stRow
+		if err := erows.Scan(&x.Barcode, &x.Name, &x.Status); err != nil {
+			erows.Close()
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		expected[x.Barcode] = x
+	}
+	erows.Close()
+
+	normal, loss, gain := []stRow{}, []stRow{}, []stRow{}
+	for bc, x := range expected {
+		if scanned[bc] {
+			normal = append(normal, x)
+		} else {
+			loss = append(loss, x) // 账面应在、实物没扫到
+		}
+	}
+	for _, s := range scans {
+		if _, ok := expected[s.Barcode]; ok {
+			continue
+		}
+		// 盘盈：扫到了但账面不在此位置——带出当前状态/位置/最近关联单据，无需人工填原因
+		var x stRow
+		x.Barcode = s.Barcode
+		var lt string
+		var did sql.NullInt64
+		if err := tx.QueryRow(`SELECT name, status, location_type, distributor_id FROM item WHERE barcode=$1`,
+			s.Barcode).Scan(&x.Name, &x.Status, &lt, &did); err != nil {
+			writeErr(w, 500, "盘盈明细查询失败: "+err.Error())
+			return
+		}
+		if lt == "总库" {
+			x.Location = "总库"
+		} else {
+			x.Location = locName(tx, did.Int64)
+		}
+		_ = tx.QueryRow(`SELECT d.doc_no FROM stock_flow sf
+			JOIN doc d ON d.id = sf.doc_id
+			JOIN item it ON it.id = sf.item_id
+			WHERE it.barcode=$1 ORDER BY sf.id DESC LIMIT 1`, s.Barcode).Scan(&x.RefDocNo)
+		gain = append(gain, x)
+	}
+
+	result, _ := json.Marshal(map[string]any{
+		"normal": len(normal), "lossList": loss, "gainList": gain,
+		"loss": len(loss), "gain": len(gain), "scanned": len(scans),
+	})
+	if _, err := tx.Exec(`UPDATE doc SET stocktake_result=$1 WHERE id=$2`, result, req.ID); err != nil {
+		writeErr(w, 500, "写入结果失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认",
+		"normal": len(normal), "loss": len(loss), "gain": len(gain)})
+}
+
+// POST /api/doc/stocktake/unconfirm {id} —— 回到草稿重盘（结果快照作废）
+func handleStocktakeUnconfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := db.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='stocktake'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := db.Exec(`UPDATE doc SET status='草稿', confirmed_at=NULL, stocktake_result=NULL
+		WHERE id=$1 AND doc_type='stocktake' AND status='已确认'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "反确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "反确认失败：单据不存在或不是已确认状态")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/stocktake/delete {id}
+func handleStocktakeDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := db.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='stocktake'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := db.Exec(`DELETE FROM doc WHERE id=$1 AND doc_type='stocktake' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "删除失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "删除失败：只有草稿可以删除（已确认的请先反确认）")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": req.ID})
+}
+
+// GET /api/doc/stocktake —— 盘点单列表（门店账号只见本店）
+func handleStocktakeList(w http.ResponseWriter, r *http.Request) {
+	cond, args := "", []any{}
+	if store := currentStore(r); store != 0 {
+		cond, args = " AND d.distributor_id=$1", []any{store}
+	}
+	rows, err := db.Query(`SELECT d.id, d.doc_no, d.status, d.draft_lines,
+		d.distributor_id, COALESCE(dd.name,'总库'), d.stocktake_result,
+		to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc d LEFT JOIN distributor dd ON dd.id = d.distributor_id
+		WHERE d.doc_type='stocktake'`+cond+` ORDER BY d.id DESC LIMIT 20`, args...)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type PDoc struct {
+		ID       int64           `json:"id"`
+		DocNo    string          `json:"docNo"`
+		Status   string          `json:"status"`
+		LocID    int64           `json:"distributorId"`
+		LocName  string          `json:"locName"`
+		Scans    []stScan        `json:"scans"`
+		Result   json.RawMessage `json:"result"`
+		MadeAt   string          `json:"madeAt"`
+	}
+	docs := []PDoc{}
+	for rows.Next() {
+		var d PDoc
+		var dl, res []byte
+		var lid sql.NullInt64
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &lid, &d.LocName, &res, &d.MadeAt); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		d.LocID = lid.Int64
+		d.Scans = []stScan{}
+		_ = json.Unmarshal(dl, &d.Scans)
+		if len(res) > 0 {
+			d.Result = res
+		} else {
+			d.Result = json.RawMessage("null")
+		}
+		docs = append(docs, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	// 查询参数：status(状态) category(大类) q(条码前缀或名称模糊) —— 都可选
 	q := r.URL.Query()
@@ -4067,6 +4499,11 @@ func main() {
 	mux.HandleFunc("POST /api/doc/transfer/unconfirm", withAuth(handleTransferUnconfirm))
 	mux.HandleFunc("POST /api/doc/transfer/delete", withAuth(handleTransferDelete))
 	mux.HandleFunc("GET /api/doc/transfer", withAuth(handleTransferList))
+	mux.HandleFunc("POST /api/doc/stocktake/save", withAuth(handleStocktakeSave))
+	mux.HandleFunc("POST /api/doc/stocktake/confirm", withAuth(handleStocktakeConfirm))
+	mux.HandleFunc("POST /api/doc/stocktake/unconfirm", withAuth(handleStocktakeUnconfirm))
+	mux.HandleFunc("POST /api/doc/stocktake/delete", withAuth(handleStocktakeDelete))
+	mux.HandleFunc("GET /api/doc/stocktake", withAuth(handleStocktakeList))
 
 	fmt.Println("后端已启动: http://localhost:8080/api/health  (Ctrl+C 停止)")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
