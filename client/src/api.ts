@@ -97,8 +97,8 @@ export const api = {
   // 金价
   goldPriceCurrent: () => request('GET', '/api/gold-price/current'),
   goldPriceHistory: () => request('GET', '/api/gold-price/history'),
-  goldPricePublish: (purity: string, retailPrice: number, recyclePrice: number) =>
-    request('POST', '/api/gold-price', { purity, retailPrice, recyclePrice }),
+  goldPricePublish: (purity: string, retailPrice: number, recyclePrice: number, tradePrice = 0) =>
+    request('POST', '/api/gold-price', { purity, retailPrice, recyclePrice, tradePrice }),
 
   // 基础资料字典
   dictList: (type: string) => request('GET', `/api/dict?type=${type}`),

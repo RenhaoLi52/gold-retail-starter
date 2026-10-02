@@ -61,6 +61,7 @@ interface GoldPrice {
   purity: string
   retailPrice: number
   recyclePrice: number
+  tradePrice: number
   by: string
   at: string
 }
@@ -70,6 +71,7 @@ const showGpHistory = ref(false)
 const gpPurity = ref('足金999.9')
 const gpRetail = ref<number | null>(null)
 const gpRecycle = ref<number | null>(null)
+const gpTrade = ref<number | null>(null)
 
 async function loadGoldPrices() {
   const r = await api.goldPriceCurrent()
@@ -78,10 +80,12 @@ async function loadGoldPrices() {
 async function publishGoldPrice() {
   errMsg.value = ''
   try {
-    await api.goldPricePublish(gpPurity.value, Number(gpRetail.value) || 0, Number(gpRecycle.value) || 0)
+    await api.goldPricePublish(gpPurity.value, Number(gpRetail.value) || 0,
+      Number(gpRecycle.value) || 0, Number(gpTrade.value) || 0)
     flash(`已发布 ${gpPurity.value} 金价`)
     gpRetail.value = null
     gpRecycle.value = null
+    gpTrade.value = null
     await loadGoldPrices()
     if (showGpHistory.value) await loadGpHistory()
   } catch (e) {
@@ -119,6 +123,7 @@ interface SDoc {
   salespersonIds: number[]
   salespersonName: string
   payments: PayLine[]
+  oldLines: { category: string; purity: string; weightG: number; tradeG?: number; recycleG?: number; credit?: number }[]
   lines: SaleLine[]
   madeAt: string
 }
@@ -129,6 +134,50 @@ const slLines = ref<SaleLine[]>([])
 const slInput = ref('')
 const slSalespersonIds = ref<number[]>([])
 const slPays = ref<PayLine[]>([])
+// v0.24 旧料区（以旧换新/旧料回收）
+interface SlOld {
+  category: string
+  purity: string
+  weightG: number | null
+}
+const slOld = ref<SlOld[]>([])
+function slAddOld() {
+  slOld.value.push({
+    category: enabledCats()[0]?.name ?? '',
+    purity: enabledPurities()[0]?.name ?? '',
+    weightG: null,
+  })
+}
+function slRemoveOld(i: number) {
+  slOld.value.splice(i, 1)
+}
+function tradeRateOf(purity: string): number {
+  return goldPrices.value.find(g => g.purity === purity)?.tradePrice ?? 0
+}
+function recycleRateOf(purity: string): number {
+  return goldPrices.value.find(g => g.purity === purity)?.recyclePrice ?? 0
+}
+// 预览拆分（与服务端同口径：金换金银换银、按录入顺序占额度；确认时以服务端为准）
+function slOldSplit() {
+  const quota: Record<string, number> = {}
+  for (const l of slLines.value) {
+    const it = items.value.find(x => x.barcode === l.barcode)
+    const c = it?.category ?? ''
+    quota[c] = (quota[c] ?? 0) + (Number(l.weightG) || 0)
+  }
+  const used: Record<string, number> = {}
+  return slOld.value.map(o => {
+    const w = Number(o.weightG) || 0
+    const avail = Math.max((quota[o.category] ?? 0) - (used[o.category] ?? 0), 0)
+    const tradeG = Math.min(w, avail)
+    used[o.category] = (used[o.category] ?? 0) + tradeG
+    const recycleG = w - tradeG
+    const credit = tradeG * tradeRateOf(o.purity) + recycleG * recycleRateOf(o.purity)
+    return { tradeG, recycleG, credit: Math.round(credit * 100) / 100 }
+  })
+}
+const slCredit = () => slOldSplit().reduce((s2, x) => s2 + x.credit, 0)
+const slNet = () => Math.round((slTotal() - slCredit()) * 100) / 100
 
 function slReset() {
   slEditingId.value = 0
@@ -137,6 +186,7 @@ function slReset() {
   slInput.value = ''
   slSalespersonIds.value = []
   slPays.value = []
+  slOld.value = []
 }
 // 多售货员：点名字切换选中，最多3人（v0.20）
 function slToggleSp(id: number) {
@@ -166,7 +216,7 @@ const slPayTotal = () => slPays.value.reduce((s2, p) => s2 + (Number(p.amount) |
 // 补足：把这一笔金额填成"应收 - 其他各笔合计"（顾客现金+微信各付一部分时特别省事）
 function slFillPay(p: PayLine) {
   const others = slPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
-  p.amount = Math.round((slTotal() - others) * 100) / 100
+  p.amount = Math.round((Math.abs(slNet()) - others) * 100) / 100
 }
 function goldRateOf(purity: string): number {
   return goldPrices.value.find(g => g.purity === purity)?.retailPrice ?? 0
@@ -227,6 +277,8 @@ async function slSave(confirmAfter: boolean) {
       payments: slPays.value
         .filter(p => p.method)
         .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
+      oldLines: slOld.value.filter(o => (Number(o.weightG) || 0) > 0)
+        .map(o => ({ category: o.category, purity: o.purity, weightG: Number(o.weightG) })),
       lines: slLines.value.map(l => ({
         barcode: l.barcode, mode: l.mode, soldPrice: Number(l.soldPrice) || 0,
       })),
@@ -289,6 +341,7 @@ function slEdit(d: SDoc) {
   slLines.value = d.lines.map(l => ({ ...l }))
   slSalespersonIds.value = [...(d.salespersonIds ?? [])]
   slPays.value = (d.payments ?? []).map(p => ({ ...p }))
+  slOld.value = (d.oldLines ?? []).map(o => ({ category: o.category, purity: o.purity, weightG: o.weightG }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -473,6 +526,7 @@ interface CommRow {
   storeName: string
   role: string
   saleComm: number
+  tradeComm: number
   managerComm: number
   returnOffset: number
   net: number
@@ -480,7 +534,7 @@ interface CommRow {
 }
 const showReport = ref(false)
 const crRows = ref<CommRow[]>([])
-const crTotals = ref({ sale: 0, mgr: 0, ret: 0, net: 0 })
+const crTotals = ref({ sale: 0, trade: 0, mgr: 0, ret: 0, net: 0 })
 const today = new Date().toISOString().slice(0, 10)
 const crFrom = ref(today.slice(0, 8) + '01') // 本月1号
 const crTo = ref(today)
@@ -494,7 +548,7 @@ async function loadReport() {
   try {
     const r = await api.commissionReport(crFrom.value, crTo.value)
     crRows.value = r.list
-    crTotals.value = { sale: r.totalSale, mgr: r.totalManager, ret: r.totalReturn, net: r.totalNet }
+    crTotals.value = { sale: r.totalSale, trade: r.totalTrade, mgr: r.totalManager, ret: r.totalReturn, net: r.totalNet }
   } catch (e) {
     errMsg.value = (e as Error).message
   }
@@ -980,6 +1034,7 @@ async function saveSp(s: Salesperson) {
 interface CommRule {
   id: number
   category: string
+  bizType: string
   mode: string
   calcType: string
   value: number
@@ -990,6 +1045,7 @@ interface CommRule {
 const commRules = ref<CommRule[]>([])
 const showRules = ref(false)
 const nrCategory = ref('')
+const nrBiz = ref('正常销售')
 const nrMode = ref('标签价')
 const nrCalc = ref('销售额百分比')
 const nrValue = ref<number | null>(null)
@@ -1012,11 +1068,12 @@ async function createRule() {
   errMsg.value = ''
   try {
     await api.commissionRuleCreate({
-      category: nrCategory.value, mode: nrMode.value,
+      category: nrCategory.value, bizType: nrBiz.value,
+      mode: nrBiz.value === '正常销售' ? nrMode.value : '',
       calcType: nrCalc.value, value: Number(nrValue.value) || 0,
       validFrom: nrFrom.value,
     })
-    flash(`提成规则新版本已建立：${nrCategory.value}×${nrMode.value}，${nrFrom.value}起生效`)
+    flash(`提成规则新版本已建立：${nrCategory.value}×${nrBiz.value}，${nrFrom.value}起生效`)
     nrValue.value = null
     await loadRules()
   } catch (e) {
@@ -1481,14 +1538,15 @@ function editDoc(d: Doc) {
         <h2>提成规则 <button class="mini" @click="loadRules">刷新</button></h2>
         <table>
           <thead>
-            <tr><th>大类</th><th>结算方式</th><th>计算方式</th><th>数值</th><th>生效从</th><th>失效至</th><th>状态</th><th>操作</th></tr>
+            <tr><th>大类</th><th>业务类型</th><th>结算方式</th><th>计算方式</th><th>数值</th><th>生效从</th><th>失效至</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="x in commRules" :key="x.id" :style="x.status === '已失效' ? 'color:#999' : ''">
               <td>{{ x.category }}</td>
-              <td>{{ x.mode }}</td>
+              <td>{{ x.bizType }}</td>
+              <td>{{ x.mode || '—' }}</td>
               <td>{{ x.calcType }}</td>
-              <td>{{ x.value }} {{ calcUnit(x.calcType) }}</td>
+              <td :style="x.value < 0 ? 'color:#c0392b' : ''">{{ x.value }} {{ calcUnit(x.calcType) }}</td>
               <td class="mono">{{ x.validFrom }}</td>
               <td class="mono">{{ x.validTo || '—' }}</td>
               <td>
@@ -1510,7 +1568,14 @@ function editDoc(d: Doc) {
               <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
             </select>
           </label>
-          <label>结算方式
+          <label>业务类型
+            <select v-model="nrBiz">
+              <option>正常销售</option>
+              <option>以旧换新</option>
+              <option>旧料回收</option>
+            </select>
+          </label>
+          <label v-if="nrBiz === '正常销售'">结算方式
             <select v-model="nrMode">
               <option>标签价</option>
               <option>变金价</option>
@@ -1523,7 +1588,8 @@ function editDoc(d: Doc) {
               <option>每件固定</option>
             </select>
           </label>
-          <label>数值 <input v-model.number="nrValue" type="number" step="0.1" style="width:80px" /> {{ calcUnit(nrCalc) }}</label>
+          <label>数值 <input v-model.number="nrValue" type="number" step="0.1" style="width:80px"
+            :placeholder="nrBiz === '以旧换新' ? '可负,如-6' : ''" /> {{ calcUnit(nrCalc) }}</label>
           <label>生效日期 <input v-model="nrFrom" type="date" /></label>
           <button @click="createRule">新增版本</button>
         </div>
@@ -1540,7 +1606,7 @@ function editDoc(d: Doc) {
         </div>
         <table v-if="crRows.length">
           <thead>
-            <tr><th>售货员</th><th>门店</th><th>角色</th><th>成交单数</th><th>销售提成</th><th>店长抽成</th><th>销退冲减</th><th>净提成</th></tr>
+            <tr><th>售货员</th><th>门店</th><th>角色</th><th>成交单数</th><th>销售提成</th><th>旧料/换新</th><th>店长抽成</th><th>销退冲减</th><th>净提成</th></tr>
           </thead>
           <tbody>
             <tr v-for="x in crRows" :key="x.salespersonId">
@@ -1549,6 +1615,7 @@ function editDoc(d: Doc) {
               <td>{{ x.role }}</td>
               <td>{{ x.docCount }}</td>
               <td>¥{{ x.saleComm.toFixed(2) }}</td>
+              <td :style="x.tradeComm < 0 ? 'color:#c0392b' : ''">{{ x.tradeComm ? '¥' + x.tradeComm.toFixed(2) : '—' }}</td>
               <td>{{ x.managerComm ? '¥' + x.managerComm.toFixed(2) : '—' }}</td>
               <td :style="x.returnOffset < 0 ? 'color:#c0392b' : ''">
                 {{ x.returnOffset ? '¥' + x.returnOffset.toFixed(2) : '—' }}</td>
@@ -1557,6 +1624,7 @@ function editDoc(d: Doc) {
             <tr style="border-top:2px solid #999">
               <td colspan="4"><b>合计</b></td>
               <td><b>¥{{ crTotals.sale.toFixed(2) }}</b></td>
+              <td :style="crTotals.trade < 0 ? 'color:#c0392b' : ''"><b>¥{{ crTotals.trade.toFixed(2) }}</b></td>
               <td><b>¥{{ crTotals.mgr.toFixed(2) }}</b></td>
               <td :style="crTotals.ret < 0 ? 'color:#c0392b' : ''"><b>¥{{ crTotals.ret.toFixed(2) }}</b></td>
               <td><b>¥{{ crTotals.net.toFixed(2) }}</b></td>
@@ -1635,11 +1703,12 @@ function editDoc(d: Doc) {
       <section class="card">
         <h2>今日金价 <button class="mini" @click="toggleGpHistory">{{ showGpHistory ? '收起历史' : '调价历史' }}</button></h2>
         <table v-if="goldPrices.length">
-          <thead><tr><th>成色</th><th>零售(元/克)</th><th>回收(元/克)</th><th>发布</th></tr></thead>
+          <thead><tr><th>成色</th><th>零售(元/克)</th><th>换新(元/克)</th><th>回收(元/克)</th><th>发布</th></tr></thead>
           <tbody>
             <tr v-for="g in goldPrices" :key="g.purity">
               <td>{{ g.purity }}</td>
               <td><b>{{ g.retailPrice.toFixed(2) }}</b></td>
+              <td>{{ (g.tradePrice ?? 0) > 0 ? g.tradePrice.toFixed(2) : '—' }}</td>
               <td>{{ g.recyclePrice > 0 ? g.recyclePrice.toFixed(2) : '—' }}</td>
               <td class="hint">{{ g.by }} · {{ g.at }}</td>
             </tr>
@@ -1654,15 +1723,17 @@ function editDoc(d: Doc) {
           </label>
           <label>零售价 <input v-model.number="gpRetail" type="number" step="0.01" style="width:100px" /></label>
           <label>回收价 <input v-model.number="gpRecycle" type="number" step="0.01" style="width:100px" placeholder="可空" /></label>
+          <label>换新价 <input v-model.number="gpTrade" type="number" step="0.01" style="width:100px" placeholder="可空" /></label>
           <button @click="publishGoldPrice">发布</button>
         </div>
         <table v-if="showGpHistory">
-          <thead><tr><th>时间</th><th>成色</th><th>零售</th><th>回收</th><th>发布人</th></tr></thead>
+          <thead><tr><th>时间</th><th>成色</th><th>零售</th><th>换新</th><th>回收</th><th>发布人</th></tr></thead>
           <tbody>
             <tr v-for="(g, i) in gpHistory" :key="i">
               <td class="hint">{{ g.at }}</td>
               <td>{{ g.purity }}</td>
               <td>{{ g.retailPrice.toFixed(2) }}</td>
+              <td>{{ (g.tradePrice ?? 0) > 0 ? g.tradePrice.toFixed(2) : '—' }}</td>
               <td>{{ g.recyclePrice > 0 ? g.recyclePrice.toFixed(2) : '—' }}</td>
               <td class="hint">{{ g.by }}</td>
             </tr>
@@ -1704,6 +1775,32 @@ function editDoc(d: Doc) {
             </tr>
           </tbody>
         </table>
+        <!-- 旧料区（v0.24 以旧换新/旧料回收）：金换金银换银，额度=本单同大类新品克重 -->
+        <template v-if="slLines.length">
+          <div class="row" v-for="(o, i) in slOld" :key="i">
+            <label>旧料大类
+              <select v-model="o.category">
+                <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
+              </select>
+            </label>
+            <label>成色
+              <select v-model="o.purity">
+                <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
+              </select>
+            </label>
+            <label>克重 <input v-model.number="o.weightG" type="number" step="0.01" style="width:90px" /></label>
+            <span class="hint" v-if="(Number(o.weightG) || 0) > 0">
+              换新 {{ slOldSplit()[i].tradeG.toFixed(2) }}g×{{ tradeRateOf(o.purity).toFixed(0) }}
+              + 回收 {{ slOldSplit()[i].recycleG.toFixed(2) }}g×{{ recycleRateOf(o.purity).toFixed(0) }}
+              = 抵 ¥{{ slOldSplit()[i].credit.toFixed(2) }}
+            </span>
+            <button class="mini danger" @click="slRemoveOld(i)">移除</button>
+          </div>
+          <div class="row">
+            <button class="mini" @click="slAddOld">+ 顾客带旧料（以旧换新/回收）</button>
+          </div>
+        </template>
+
         <!-- 售货员（1~3人，点名字选中，整单平分）+ 组合收款 -->
         <div class="row" v-if="slLines.length">
           <span>售货员(可多选，整单平分)：</span>
@@ -1728,14 +1825,20 @@ function editDoc(d: Doc) {
           <div class="row">
             <button class="mini" @click="slAddPay">+ 添加收款方式</button>
             <span class="hint" v-if="slPays.length">
-              已收 ¥{{ slPayTotal().toFixed(2) }} / 应收 ¥{{ slTotal().toFixed(2) }}
-              <b v-if="Math.abs(slPayTotal() - slTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (slTotal() - slPayTotal()).toFixed(2) }}）</b>
+              {{ slNet() >= 0 ? '已收' : '已退' }} ¥{{ slPayTotal().toFixed(2) }} /
+              {{ slNet() >= 0 ? '净应收' : '应退顾客' }} ¥{{ Math.abs(slNet()).toFixed(2) }}
+              <b v-if="Math.abs(slPayTotal() - Math.abs(slNet())) > 0.005" style="color:#c0392b">（差 ¥{{ (Math.abs(slNet()) - slPayTotal()).toFixed(2) }}）</b>
               <b v-else style="color:#2f7d4f">✓ 两讫</b>
             </span>
           </div>
         </template>
         <div class="row" v-if="slLines.length">
-          <p class="ok" style="margin:0">合计：¥{{ slTotal().toFixed(2) }}</p>
+          <p class="ok" style="margin:0">
+            货款 ¥{{ slTotal().toFixed(2) }}
+            <template v-if="slCredit() > 0"> − 旧料抵扣 ¥{{ slCredit().toFixed(2) }} =
+              <b :style="slNet() < 0 ? 'color:#c0392b' : ''">{{ slNet() >= 0 ? '净应收' : '应退顾客' }} ¥{{ Math.abs(slNet()).toFixed(2) }}</b>
+            </template>
+          </p>
           <span class="spacer"></span>
           <button class="gray" @click="slSave(false)">保存草稿(挂单)</button>
           <button @click="slSave(true)">确认收款</button>
@@ -1750,7 +1853,11 @@ function editDoc(d: Doc) {
           <div class="dochead">
             <span class="mono">{{ d.docNo }}</span>
             <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
-            <span class="ok" v-if="d.totalAmount > 0">¥{{ d.totalAmount.toFixed(2) }}</span>
+            <span class="ok" v-if="d.totalAmount !== 0">{{ d.totalAmount < 0 ? '退 ' : '' }}¥{{ Math.abs(d.totalAmount).toFixed(2) }}</span>
+            <span class="hint" v-if="d.oldLines?.length">
+              旧料 {{ d.oldLines.reduce((s2, o) => s2 + (o.weightG || 0), 0).toFixed(2) }}g
+              {{ d.oldLines.some(o => o.credit) ? '抵 ¥' + d.oldLines.reduce((s2, o) => s2 + (o.credit || 0), 0).toFixed(2) : '' }}
+            </span>
             <span v-if="d.salespersonName">售货员：{{ d.salespersonName }}</span>
             <span class="hint" v-if="d.payments?.length">
               {{ d.payments.map(p => `${p.method}¥${Number(p.amount ?? 0).toFixed(2)}`).join(' + ') }}

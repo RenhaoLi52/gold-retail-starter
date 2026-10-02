@@ -915,12 +915,12 @@ func handleCommissionRuleList(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
-	rows, err := db.Query(`SELECT id, category, mode, calc_type, value,
+	rows, err := db.Query(`SELECT id, category, biz_type, mode, calc_type, value,
 		to_char(valid_from,'YYYY-MM-DD'), COALESCE(to_char(valid_to,'YYYY-MM-DD'),''),
 		CASE WHEN valid_from > CURRENT_DATE THEN '未生效'
 		     WHEN valid_to IS NOT NULL AND valid_to < CURRENT_DATE THEN '已失效'
 		     ELSE '生效中' END
-		FROM commission_rule ORDER BY category, mode, valid_from DESC`)
+		FROM commission_rule ORDER BY category, biz_type, mode, valid_from DESC`)
 	if err != nil {
 		writeErr(w, 500, "查询失败: "+err.Error())
 		return
@@ -929,6 +929,7 @@ func handleCommissionRuleList(w http.ResponseWriter, r *http.Request) {
 	type R struct {
 		ID        int64   `json:"id"`
 		Category  string  `json:"category"`
+		BizType   string  `json:"bizType"`
 		Mode      string  `json:"mode"`
 		CalcType  string  `json:"calcType"`
 		Value     float64 `json:"value"`
@@ -939,7 +940,7 @@ func handleCommissionRuleList(w http.ResponseWriter, r *http.Request) {
 	list := []R{}
 	for rows.Next() {
 		var x R
-		if err := rows.Scan(&x.ID, &x.Category, &x.Mode, &x.CalcType, &x.Value,
+		if err := rows.Scan(&x.ID, &x.Category, &x.BizType, &x.Mode, &x.CalcType, &x.Value,
 			&x.ValidFrom, &x.ValidTo, &x.Status); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
@@ -960,6 +961,7 @@ func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Category  string  `json:"category"`
+		BizType   string  `json:"bizType"` // 正常销售/以旧换新/旧料回收，空=正常销售
 		Mode      string  `json:"mode"`
 		CalcType  string  `json:"calcType"`
 		Value     float64 `json:"value"`
@@ -976,20 +978,42 @@ func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "首饰大类不存在")
 		return
 	}
-	if req.Mode != "标签价" && req.Mode != "变金价" {
-		writeErr(w, 400, "结算方式必须是 标签价 或 变金价")
+	if req.BizType == "" {
+		req.BizType = "正常销售"
+	}
+	switch req.BizType {
+	case "正常销售":
+		if req.Mode != "标签价" && req.Mode != "变金价" {
+			writeErr(w, 400, "结算方式必须是 标签价 或 变金价")
+			return
+		}
+		if req.Value <= 0 {
+			writeErr(w, 400, "数值必须大于0")
+			return
+		}
+	case "以旧换新":
+		// 换新是"折扣"：通常配负值（抵减正常销售提成），也允许正值；不允许0
+		req.Mode = ""
+		if req.Value == 0 {
+			writeErr(w, 400, "数值不能为0（换新折扣通常为负值，如 -6 元/克）")
+			return
+		}
+	case "旧料回收":
+		req.Mode = ""
+		if req.Value <= 0 {
+			writeErr(w, 400, "数值必须大于0")
+			return
+		}
+	default:
+		writeErr(w, 400, "业务类型必须是 正常销售/以旧换新/旧料回收")
 		return
 	}
 	if !validCalcTypes[req.CalcType] {
 		writeErr(w, 400, "计算方式必须是 销售额百分比/每克固定/每件固定")
 		return
 	}
-	if req.Value <= 0 {
-		writeErr(w, 400, "数值必须大于0")
-		return
-	}
-	if req.CalcType == "销售额百分比" && req.Value > 100 {
-		writeErr(w, 400, "百分比不能超过100")
+	if req.CalcType == "销售额百分比" && (req.Value > 100 || req.Value < -100) {
+		writeErr(w, 400, "百分比不能超过±100")
 		return
 	}
 	if req.ValidFrom == "" {
@@ -1011,8 +1035,8 @@ func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 	var latestFrom string
 	var latestTo sql.NullString
 	err = tx.QueryRow(`SELECT id, to_char(valid_from,'YYYY-MM-DD'), to_char(valid_to,'YYYY-MM-DD')
-		FROM commission_rule WHERE category=$1 AND mode=$2
-		ORDER BY valid_from DESC, id DESC LIMIT 1 FOR UPDATE`, req.Category, req.Mode).
+		FROM commission_rule WHERE category=$1 AND mode=$2 AND biz_type=$3
+		ORDER BY valid_from DESC, id DESC LIMIT 1 FOR UPDATE`, req.Category, req.Mode, req.BizType).
 		Scan(&latestID, &latestFrom, &latestTo)
 	if err != nil && err != sql.ErrNoRows {
 		writeErr(w, 500, "查询失败: "+err.Error())
@@ -1035,9 +1059,9 @@ func handleCommissionRuleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var id int64
-	if err := tx.QueryRow(`INSERT INTO commission_rule (category, mode, calc_type, value, valid_from)
-		VALUES ($1,$2,$3,$4,$5::date) RETURNING id`,
-		req.Category, req.Mode, req.CalcType, req.Value, req.ValidFrom).Scan(&id); err != nil {
+	if err := tx.QueryRow(`INSERT INTO commission_rule (category, mode, biz_type, calc_type, value, valid_from)
+		VALUES ($1,$2,$3,$4,$5,$6::date) RETURNING id`,
+		req.Category, req.Mode, req.BizType, req.CalcType, req.Value, req.ValidFrom).Scan(&id); err != nil {
 		writeErr(w, 500, "创建失败: "+err.Error())
 		return
 	}
@@ -1073,9 +1097,9 @@ func handleCommissionRuleUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer tx.Rollback()
-		var cat, mode, from string
+		var cat, mode, biz, from string
 		err = tx.QueryRow(`DELETE FROM commission_rule WHERE id=$1 AND valid_from > CURRENT_DATE
-			RETURNING category, mode, to_char(valid_from,'YYYY-MM-DD')`, req.ID).Scan(&cat, &mode, &from)
+			RETURNING category, mode, biz_type, to_char(valid_from,'YYYY-MM-DD')`, req.ID).Scan(&cat, &mode, &biz, &from)
 		if err == sql.ErrNoRows {
 			writeErr(w, 400, "只能取消还没生效的排期版本——已生效的版本请用\"结束\"关闭")
 			return
@@ -1086,9 +1110,9 @@ func handleCommissionRuleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		// 上一版本若恰好结束在排期前一天（自动关闭留下的痕迹），重新打开
 		if _, err := tx.Exec(`UPDATE commission_rule SET valid_to = NULL
-			WHERE id = (SELECT id FROM commission_rule WHERE category=$1 AND mode=$2
-				AND valid_to = $3::date - 1
-				ORDER BY valid_from DESC, id DESC LIMIT 1)`, cat, mode, from); err != nil {
+			WHERE id = (SELECT id FROM commission_rule WHERE category=$1 AND mode=$2 AND biz_type=$3
+				AND valid_to = $4::date - 1
+				ORDER BY valid_from DESC, id DESC LIMIT 1)`, cat, mode, biz, from); err != nil {
 			writeErr(w, 500, "恢复上一版本失败: "+err.Error())
 			return
 		}
@@ -1134,6 +1158,7 @@ func handleCommissionReport(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := db.Query(`SELECT sp.id, sp.name, COALESCE(d.name,'总部'), sp.role,
 		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='销售'), 0),
+		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind IN ('以旧换新','旧料回收')), 0),
 		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='店长抽成'), 0),
 		COALESCE(SUM(cf.amount) FILTER (WHERE cf.kind='销退冲减'), 0),
 		COALESCE(SUM(cf.amount), 0),
@@ -1155,29 +1180,84 @@ func handleCommissionReport(w http.ResponseWriter, r *http.Request) {
 		StoreName     string  `json:"storeName"`
 		Role          string  `json:"role"`
 		SaleComm      float64 `json:"saleComm"`
+		TradeComm     float64 `json:"tradeComm"` // 以旧换新(负)+旧料回收(正)
 		ManagerComm   float64 `json:"managerComm"`
 		ReturnOffset  float64 `json:"returnOffset"`
 		Net           float64 `json:"net"`
 		DocCount      int     `json:"docCount"`
 	}
 	list := []Row{}
-	var tSale, tMgr, tRet, tNet float64
+	var tSale, tTrade, tMgr, tRet, tNet float64
 	for rows.Next() {
 		var x Row
 		if err := rows.Scan(&x.SalespersonID, &x.Name, &x.StoreName, &x.Role,
-			&x.SaleComm, &x.ManagerComm, &x.ReturnOffset, &x.Net, &x.DocCount); err != nil {
+			&x.SaleComm, &x.TradeComm, &x.ManagerComm, &x.ReturnOffset, &x.Net, &x.DocCount); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
 		tSale += x.SaleComm
+		tTrade += x.TradeComm
 		tMgr += x.ManagerComm
 		tRet += x.ReturnOffset
 		tNet += x.Net
 		list = append(list, x)
 	}
 	writeJSON(w, 200, map[string]any{"list": list,
-		"totalSale": round2(tSale), "totalManager": round2(tMgr),
+		"totalSale": round2(tSale), "totalTrade": round2(tTrade), "totalManager": round2(tMgr),
 		"totalReturn": round2(tRet), "totalNet": round2(tNet)})
+}
+
+// oldCommission 旧料业务（以旧换新/旧料回收）的提成：按克重或按抵扣金额（v0.24）。
+// 以旧换新的规则通常是负值（折扣），引擎只管按规则算、照实入账。
+func oldCommission(tx *sql.Tx, category, bizType string, grams, amountBase float64) (float64, error) {
+	var calcType string
+	var value float64
+	err := tx.QueryRow(`SELECT calc_type, value FROM commission_rule
+		WHERE category=$1 AND biz_type=$2
+		AND valid_from <= CURRENT_DATE
+		AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
+		ORDER BY valid_from DESC, id DESC LIMIT 1`, category, bizType).Scan(&calcType, &value)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	switch calcType {
+	case "销售额百分比":
+		return round2(amountBase * value / 100), nil
+	case "每克固定":
+		return round2(grams * value), nil
+	case "每件固定":
+		return round2(value), nil
+	}
+	return 0, nil
+}
+
+// postCommission 把一笔提成总额按"多人平分+店长抽成"写进台账（正负通吃，v0.24）
+func postCommission(tx *sql.Tx, docID int64, barcode, kind string, totalC float64, sps []spInfo, mgr *spInfo) error {
+	if totalC == 0 || len(sps) == 0 {
+		return nil
+	}
+	share := round2(totalC / float64(len(sps)))
+	for _, s := range sps {
+		amt := share
+		if s.Role == "店员" && mgr != nil && mgr.ManagerRate > 0 {
+			cut := round2(share * mgr.ManagerRate / 100)
+			amt = round2(share - cut)
+			if cut != 0 {
+				if _, err := tx.Exec(`INSERT INTO commission_flow (doc_id, barcode, salesperson_id, kind, amount)
+					VALUES ($1,$2,$3,'店长抽成',$4)`, docID, barcode, mgr.ID, cut); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.Exec(`INSERT INTO commission_flow (doc_id, barcode, salesperson_id, kind, amount)
+			VALUES ($1,$2,$3,$4,$5)`, docID, barcode, s.ID, kind, amt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // spInfo 确认时用到的售货员信息
@@ -1205,7 +1285,7 @@ func lineCommission(tx *sql.Tx, category, mode string, soldPrice, weightG float6
 	var calcType string
 	var value float64
 	err := tx.QueryRow(`SELECT calc_type, value FROM commission_rule
-		WHERE category=$1 AND mode=$2
+		WHERE category=$1 AND mode=$2 AND biz_type='正常销售'
 		AND valid_from <= CURRENT_DATE
 		AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
 		ORDER BY valid_from DESC, id DESC LIMIT 1`, category, mode).Scan(&calcType, &value)
@@ -1625,7 +1705,7 @@ func handleOutboundList(w http.ResponseWriter, r *http.Request) {
 // GET /api/gold-price/current —— 每个成色的最新价（所有登录用户，开单要用）
 func handleGoldPriceCurrent(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT DISTINCT ON (gp.purity) gp.purity, gp.retail_price, gp.recycle_price,
+		SELECT DISTINCT ON (gp.purity) gp.purity, gp.retail_price, gp.recycle_price, gp.trade_price,
 		       u.name, to_char(gp.published_at,'MM-DD HH24:MI')
 		FROM gold_price gp JOIN app_user u ON u.id = gp.published_by
 		ORDER BY gp.purity, gp.id DESC`)
@@ -1638,13 +1718,14 @@ func handleGoldPriceCurrent(w http.ResponseWriter, r *http.Request) {
 		Purity       string  `json:"purity"`
 		RetailPrice  float64 `json:"retailPrice"`
 		RecyclePrice float64 `json:"recyclePrice"`
+		TradePrice   float64 `json:"tradePrice"`
 		By           string  `json:"by"`
 		At           string  `json:"at"`
 	}
 	list := []P{}
 	for rows.Next() {
 		var x P
-		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.By, &x.At); err != nil {
+		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.TradePrice, &x.By, &x.At); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -1656,7 +1737,7 @@ func handleGoldPriceCurrent(w http.ResponseWriter, r *http.Request) {
 // GET /api/gold-price/history —— 最近50条发布记录
 func handleGoldPriceHistory(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT gp.purity, gp.retail_price, gp.recycle_price, u.name,
+		SELECT gp.purity, gp.retail_price, gp.recycle_price, gp.trade_price, u.name,
 		       to_char(gp.published_at,'YYYY-MM-DD HH24:MI:SS')
 		FROM gold_price gp JOIN app_user u ON u.id = gp.published_by
 		ORDER BY gp.id DESC LIMIT 50`)
@@ -1669,13 +1750,14 @@ func handleGoldPriceHistory(w http.ResponseWriter, r *http.Request) {
 		Purity       string  `json:"purity"`
 		RetailPrice  float64 `json:"retailPrice"`
 		RecyclePrice float64 `json:"recyclePrice"`
+		TradePrice   float64 `json:"tradePrice"`
 		By           string  `json:"by"`
 		At           string  `json:"at"`
 	}
 	list := []P{}
 	for rows.Next() {
 		var x P
-		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.By, &x.At); err != nil {
+		if err := rows.Scan(&x.Purity, &x.RetailPrice, &x.RecyclePrice, &x.TradePrice, &x.By, &x.At); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -1693,6 +1775,7 @@ func handleGoldPricePublish(w http.ResponseWriter, r *http.Request) {
 		Purity       string  `json:"purity"`
 		RetailPrice  float64 `json:"retailPrice"`
 		RecyclePrice float64 `json:"recyclePrice"`
+		TradePrice   float64 `json:"tradePrice"` // v0.24：以旧换新价（给顾客旧料的折价）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "参数格式错误")
@@ -1721,10 +1804,22 @@ func handleGoldPricePublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "回收金价不应高于零售金价，请核对")
 		return
 	}
+	// v0.24：换新价可不填（0=该成色不支持换新）；填了必须落在 回收价~零售价 之间——
+	// 换新本质是"回收价上稍微加一点"，高过零售价或低于回收价都是手滑
+	if req.TradePrice != 0 {
+		if req.TradePrice < req.RecyclePrice {
+			writeErr(w, 400, "换新价不应低于回收价，请核对")
+			return
+		}
+		if req.TradePrice > req.RetailPrice {
+			writeErr(w, 400, "换新价不应高于零售金价，请核对")
+			return
+		}
+	}
 	var id int64
-	if err := db.QueryRow(`INSERT INTO gold_price (purity, retail_price, recycle_price, published_by)
-		VALUES ($1,$2,$3,$4) RETURNING id`,
-		req.Purity, req.RetailPrice, req.RecyclePrice, currentUID(r)).Scan(&id); err != nil {
+	if err := db.QueryRow(`INSERT INTO gold_price (purity, retail_price, recycle_price, trade_price, published_by)
+		VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+		req.Purity, req.RetailPrice, req.RecyclePrice, req.TradePrice, currentUID(r)).Scan(&id); err != nil {
 		writeErr(w, 500, "发布失败: "+err.Error())
 		return
 	}
@@ -1746,6 +1841,20 @@ type SaleLine struct {
 	Price     float64 `json:"price"`     // 标签价快照(加入时)
 	Mode      string  `json:"mode"`      // 标签价 / 变金价
 	SoldPrice float64 `json:"soldPrice"` // 实售价(可议价)
+}
+
+// OldLine 旧料行（v0.24 以旧换新/旧料回收）：旧料不是系统货品，没有条码，
+// 只记 大类（换新额度按大类匹配：金换金银换银）、成色（定价按成色）、克重。
+// TradeG/RecycleG/各价格在确认时拆分并快照——此前都是预览。
+type OldLine struct {
+	Category     string  `json:"category"`
+	Purity       string  `json:"purity"`
+	WeightG      float64 `json:"weightG"`
+	TradeG       float64 `json:"tradeG,omitempty"`
+	RecycleG     float64 `json:"recycleG,omitempty"`
+	TradePrice   float64 `json:"tradePrice,omitempty"`
+	RecyclePrice float64 `json:"recyclePrice,omitempty"`
+	Credit       float64 `json:"credit,omitempty"` // 本行抵扣金额
 }
 
 // currentGoldPrice 查某成色当前零售金价；无发布记录返回 ok=false
@@ -1789,6 +1898,7 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		ID             int64     `json:"id"`
 		SalespersonIDs []int64   `json:"salespersonIds"` // v0.20：1~3人整单平分
 		Payments       []PayLine `json:"payments"`
+		OldLines       []OldLine `json:"oldLines"` // v0.24：旧料行（以旧换新/回收）
 		Lines          []struct {
 			Barcode   string  `json:"barcode"`
 			Mode      string  `json:"mode"`
@@ -1796,8 +1906,26 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		} `json:"lines"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Lines) == 0 {
-		writeErr(w, 400, "参数错误：至少要有一行")
+		writeErr(w, 400, "参数错误：至少要有一行新品（纯旧料回收单据后续另做）")
 		return
+	}
+	// v0.24 旧料行基础校验：大类/成色是启用字典项、克重>0（拆分与定价在确认时做）
+	for i, ol := range req.OldLines {
+		var catOK, puOK bool
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item WHERE dict_type='category' AND name=$1 AND enabled=true)`, ol.Category).Scan(&catOK)
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item WHERE dict_type='purity' AND name=$1 AND enabled=true)`, ol.Purity).Scan(&puOK)
+		if !catOK {
+			writeErr(w, 400, fmt.Sprintf("旧料第%d行大类「%s」不存在或已停用", i+1, ol.Category))
+			return
+		}
+		if !puOK {
+			writeErr(w, 400, fmt.Sprintf("旧料第%d行成色「%s」不存在或已停用", i+1, ol.Purity))
+			return
+		}
+		if ol.WeightG <= 0 {
+			writeErr(w, 400, fmt.Sprintf("旧料第%d行克重必须大于0", i+1))
+			return
+		}
 	}
 	// 草稿阶段的宽松校验：售货员/收款可以先不填（挂单常在收款前），
 	// 但填了就不能是明显错的。收款合计=应收 的硬校验放在确认时。
@@ -1846,6 +1974,10 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spIDsJSON, _ := json.Marshal(spIDs)
+	if req.OldLines == nil {
+		req.OldLines = []OldLine{}
+	}
+	oldJSON, _ := json.Marshal(req.OldLines)
 
 	// v0.15 挂单即锁定：保存草稿这一刻就把货品 在库→销售中，并发裁决从"确认"提前到"挂单"。
 	// 解锁+锁定+存单在同一个事务里——要么全成，要么全不动。
@@ -1958,9 +2090,9 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		}
 		docNo := fmt.Sprintf("XS%s%02d", today, seq)
 		var docID int64
-		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines, salesperson_ids, payments, distributor_id)
-			VALUES ($1,'sale','草稿',$2,$3,$4,$5,$6) RETURNING id`, docNo, currentUID(r), linesJSON, spIDsJSON, paysJSON,
-			nullableID(store)).Scan(&docID)
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, draft_lines, salesperson_ids, payments, old_lines, distributor_id)
+			VALUES ($1,'sale','草稿',$2,$3,$4,$5,$6,$7) RETURNING id`, docNo, currentUID(r), linesJSON, spIDsJSON, paysJSON,
+			oldJSON, nullableID(store)).Scan(&docID)
 		if err != nil {
 			writeErr(w, 500, "保存失败: "+err.Error())
 			return
@@ -1972,8 +2104,8 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
 		return
 	}
-	if _, err := tx.Exec(`UPDATE doc SET draft_lines=$1, salesperson_ids=$2, payments=$3
-		WHERE id=$4`, linesJSON, spIDsJSON, paysJSON, req.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE doc SET draft_lines=$1, salesperson_ids=$2, payments=$3, old_lines=$4
+		WHERE id=$5`, linesJSON, spIDsJSON, paysJSON, oldJSON, req.ID); err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
@@ -2019,10 +2151,10 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
 		return
 	}
-	var linesJSON, paysJSON, spIDsJSON []byte
+	var linesJSON, paysJSON, spIDsJSON, oldJSON []byte
 	var legacySpID, docStore sql.NullInt64
-	if err := tx.QueryRow(`SELECT draft_lines, salesperson_ids, salesperson_id, payments, distributor_id
-		FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON, &spIDsJSON, &legacySpID, &paysJSON, &docStore); err != nil {
+	if err := tx.QueryRow(`SELECT draft_lines, salesperson_ids, salesperson_id, payments, old_lines, distributor_id
+		FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON, &spIDsJSON, &legacySpID, &paysJSON, &oldJSON, &docStore); err != nil {
 		writeErr(w, 500, "读取单据失败: "+err.Error())
 		return
 	}
@@ -2085,12 +2217,11 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 确认时硬校验二：收款明细合法，且每种方式都是启用的字典项
+	// （v0.24：是否必须录收款，要等算出"净应收"才知道——两讫校验挪到后面）
 	var pays []PayLine
 	_ = json.Unmarshal(paysJSON, &pays)
-	if len(pays) == 0 {
-		writeErr(w, 400, "请先录入收款方式再确认收款")
-		return
-	}
+	var oldLines []OldLine
+	_ = json.Unmarshal(oldJSON, &oldLines)
 	if err := validatePayments(pays); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -2117,6 +2248,7 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	snaps := []snapLine{}
 	var total float64
+	newWeightByCat := map[string]float64{} // v0.24：换新额度=本单各大类新品克重
 	for i, l := range lines {
 		// v0.15：正常流程里件已在挂单时锁定，这里 销售中→已售；
 		// 兼容 v0.14 之前保存的老草稿（件还是在库），所以两种来源状态都接受。
@@ -2165,6 +2297,7 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		snaps = append(snaps, sp)
 		total += l.SoldPrice
+		newWeightByCat[itemCat] += l.WeightG
 		if _, err = tx.Exec(`INSERT INTO doc_line (doc_id, item_id, line_no) VALUES ($1,$2,$3)`,
 			req.ID, itemID, i+1); err != nil {
 			writeErr(w, 500, "写入明细失败: "+err.Error())
@@ -2205,19 +2338,110 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 确认时硬校验三：收款合计必须分毫不差等于应收合计
+	// ===== v0.24 旧料拆分与抵扣：金换金银换银，额度=本单该大类新品克重 =====
+	usedByCat := map[string]float64{}
+	var credit float64
+	for i := range oldLines {
+		ol := &oldLines[i]
+		avail := newWeightByCat[ol.Category] - usedByCat[ol.Category]
+		if avail < 0 {
+			avail = 0
+		}
+		ol.TradeG = ol.WeightG
+		if ol.TradeG > avail {
+			ol.TradeG = avail
+		}
+		ol.RecycleG = round2(ol.WeightG - ol.TradeG)
+		ol.TradeG = round2(ol.TradeG)
+		usedByCat[ol.Category] += ol.TradeG
+		// 价格快照：按成色取当日换新价/回收价
+		var tp, rp float64
+		err := tx.QueryRow(`SELECT trade_price, recycle_price FROM gold_price
+			WHERE purity=$1 ORDER BY id DESC LIMIT 1`, ol.Purity).Scan(&tp, &rp)
+		if err == sql.ErrNoRows {
+			writeErr(w, 400, fmt.Sprintf("旧料成色「%s」今日未发布金价，整单未确认", ol.Purity))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "金价查询失败: "+err.Error())
+			return
+		}
+		if ol.TradeG > 0 && tp <= 0 {
+			writeErr(w, 400, fmt.Sprintf("成色「%s」未发布换新价，不能以旧换新，整单未确认", ol.Purity))
+			return
+		}
+		if ol.RecycleG > 0 && rp <= 0 {
+			writeErr(w, 400, fmt.Sprintf("成色「%s」未发布回收价，不能回收旧料，整单未确认", ol.Purity))
+			return
+		}
+		ol.TradePrice, ol.RecyclePrice = tp, rp
+		ol.Credit = round2(ol.TradeG*tp + ol.RecycleG*rp)
+		credit += ol.Credit
+		// 旧料提成：换新部分（规则通常为负=折扣）+ 回收部分（正提成）
+		if ol.TradeG > 0 {
+			c, e := oldCommission(tx, ol.Category, "以旧换新", ol.TradeG, round2(ol.TradeG*tp))
+			if e != nil {
+				writeErr(w, 500, "提成规则查询失败: "+e.Error())
+				return
+			}
+			if e := postCommission(tx, req.ID, "旧料", "以旧换新", c, sps, mgr); e != nil {
+				writeErr(w, 500, "提成入账失败: "+e.Error())
+				return
+			}
+		}
+		if ol.RecycleG > 0 {
+			c, e := oldCommission(tx, ol.Category, "旧料回收", ol.RecycleG, round2(ol.RecycleG*rp))
+			if e != nil {
+				writeErr(w, 500, "提成规则查询失败: "+e.Error())
+				return
+			}
+			if e := postCommission(tx, req.ID, "旧料", "旧料回收", c, sps, mgr); e != nil {
+				writeErr(w, 500, "提成入账失败: "+e.Error())
+				return
+			}
+		}
+	}
+
+	// 确认时硬校验三：两讫——净应收>0 收款合计须相等；净应收<0（倒付顾客）退款合计须相等；
+	// 净应收恰好为0（旧料抵扣=货款）允许不录收款。
+	net := round2(total - credit)
 	var paySum float64
 	for _, p := range pays {
 		paySum += p.Amount
 	}
-	if round2(paySum) != round2(total) {
-		writeErr(w, 400, fmt.Sprintf("收款合计 ¥%.2f 与应收合计 ¥%.2f 不一致，整单未确认", paySum, total))
-		return
+	paySum = round2(paySum)
+	switch {
+	case net > 0:
+		if len(pays) == 0 {
+			writeErr(w, 400, "请先录入收款方式再确认收款")
+			return
+		}
+		if paySum != net {
+			writeErr(w, 400, fmt.Sprintf("收款合计 ¥%.2f 与净应收 ¥%.2f 不一致（货款%.2f−旧料抵扣%.2f），整单未确认",
+				paySum, net, total, credit))
+			return
+		}
+	case net < 0:
+		if len(pays) == 0 {
+			writeErr(w, 400, fmt.Sprintf("旧料抵扣超过货款，应退顾客 ¥%.2f——请录入退款方式再确认", -net))
+			return
+		}
+		if paySum != -net {
+			writeErr(w, 400, fmt.Sprintf("退款合计 ¥%.2f 与应退顾客 ¥%.2f 不一致，整单未确认", paySum, -net))
+			return
+		}
+	default:
+		if paySum != 0 {
+			writeErr(w, 400, "旧料抵扣恰好等于货款（两讫），不应再录收款金额")
+			return
+		}
 	}
 
-	snapshot, _ := json.Marshal(map[string]any{"rates": rates, "lines": snaps})
-	if _, err = tx.Exec(`UPDATE doc SET total_amount=$1, gold_price_snapshot=$2 WHERE id=$3`,
-		round2(total), snapshot, req.ID); err != nil {
+	snapshot, _ := json.Marshal(map[string]any{"rates": rates, "lines": snaps,
+		"oldLines": oldLines, "credit": round2(credit), "itemTotal": round2(total)})
+	processedOld, _ := json.Marshal(oldLines)
+	if _, err = tx.Exec(`UPDATE doc SET total_amount=$1, gold_price_snapshot=$2, old_lines=$3 WHERE id=$4`,
+		net, snapshot, processedOld, req.ID); err != nil {
 		writeErr(w, 500, "写入合计失败: "+err.Error())
 		return
 	}
@@ -2225,7 +2449,8 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "提交失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认", "totalAmount": round2(total)})
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认",
+		"totalAmount": net, "itemTotal": round2(total), "credit": round2(credit)})
 }
 
 // round2 四舍五入到分。踩坑10：旧实现 int64(v*100+0.5) 对负数向零截断，
@@ -2405,7 +2630,7 @@ func handleSaleList(w http.ResponseWriter, r *http.Request) {
 		nrows.Close()
 	}
 	rows, err := db.Query(`SELECT d.id, d.doc_no, d.status, d.draft_lines, d.total_amount,
-		d.salesperson_ids, d.payments,
+		d.salesperson_ids, d.payments, d.old_lines,
 		to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS')
 		FROM doc d
 		WHERE d.doc_type='sale'`+cond+` ORDER BY d.id DESC LIMIT 20`, args...)
@@ -2422,15 +2647,16 @@ func handleSaleList(w http.ResponseWriter, r *http.Request) {
 		SalespersonIDs  []int64    `json:"salespersonIds"`
 		SalespersonName string     `json:"salespersonName"` // 多人用"、"连接
 		Payments        []PayLine  `json:"payments"`
+		OldLines        []OldLine  `json:"oldLines"`
 		Lines           []SaleLine `json:"lines"`
 		MadeAt          string     `json:"madeAt"`
 	}
 	docs := []SDoc{}
 	for rows.Next() {
 		var d SDoc
-		var dl, pj, spj []byte
+		var dl, pj, spj, oj []byte
 		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &d.TotalAmount,
-			&spj, &pj, &d.MadeAt); err != nil {
+			&spj, &pj, &oj, &d.MadeAt); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -2447,6 +2673,8 @@ func handleSaleList(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(dl, &d.Lines)
 		d.Payments = []PayLine{}
 		_ = json.Unmarshal(pj, &d.Payments)
+		d.OldLines = []OldLine{}
+		_ = json.Unmarshal(oj, &d.OldLines)
 		docs = append(docs, d)
 	}
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
