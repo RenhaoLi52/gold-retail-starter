@@ -2,7 +2,7 @@
 // 入库单界面 v0.3：支持单据生命周期——保存草稿 → 确认 → 反确认 / 删除草稿
 // 草稿可反复编辑；确认后生成货品件进入库存；反确认撤回（条码保留）。
 import { onMounted, ref } from 'vue'
-import { api, setToken, hasToken, clearToken, downloadFile } from './api'
+import { api, setToken, hasToken, clearToken, downloadFile, uploadFile } from './api'
 
 // ===== 登录 =====
 const logged = ref(false)
@@ -1450,6 +1450,33 @@ async function refreshAll() {
   await loadSalespersons()
 }
 
+// v0.29：Excel 批量入库导入（全有或全无，停在出错行）
+const importFileEl = ref<HTMLInputElement | null>(null)
+async function downloadImportTemplate() {
+  errMsg.value = ''
+  try {
+    await downloadFile('/api/doc/inbound/import-template', '入库导入模板.xlsx')
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function importExcel(ev: Event) {
+  errMsg.value = ''
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许连续导入同名文件
+  if (!file) return
+  try {
+    const r = await uploadFile('/api/doc/inbound/import', file, { category: category.value })
+    flash(`已导入 ${r.count} 行到草稿 ${r.docNo}——请复核后确认`)
+    await refreshAll()
+    const d = docs.value.find(x => x.id === r.id)
+    if (d) editDoc(d)
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 // v0.26：导出该入库单的 Label Matrix 标签数据文件
 async function exportLabels(d: Doc) {
   errMsg.value = ''
@@ -2335,6 +2362,10 @@ function editDoc(d: Doc) {
               <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
             </select>
           </label>
+          <span class="spacer"></span>
+          <button class="mini" @click="downloadImportTemplate">下载导入模板</button>
+          <button class="mini" @click="importFileEl?.click()">Excel导入</button>
+          <input ref="importFileEl" type="file" accept=".xlsx" style="display:none" @change="importExcel" />
         </div>
         <table>
           <thead>

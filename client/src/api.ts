@@ -73,6 +73,21 @@ export async function downloadFile(path: string, filename: string) {
   URL.revokeObjectURL(url)
 }
 
+// 上传文件（multipart，带令牌）
+export async function uploadFile(path: string, file: File, fields: Record<string, string>) {
+  const fd = new FormData()
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v)
+  fd.append('file', file)
+  const res = await fetch(API_BASE + path, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: fd,
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error((data as { error?: string }).error || `上传失败(${res.status})`)
+  return data
+}
+
 export const api = {
   login: (username: string, password: string) =>
     request('POST', '/api/login', { username, password }),

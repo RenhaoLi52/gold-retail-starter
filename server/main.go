@@ -18,6 +18,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
@@ -26,6 +27,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math"
@@ -4852,6 +4854,308 @@ func writeXLSX(w io.Writer, sheetName string, rows [][]string) error {
 	return zw.Close()
 }
 
+// ===== Excel 批量入库导入（v0.29） =====
+// 口径（用户第0章就点名）：全有或全无——任何一行出错，整单不保存，报出 Excel 行号。
+// 模板是我们自己的精简列；读取器用标准库手写（zip+XML，支持共享字符串/内联字符串/数值）。
+
+var importHeaders = []string{"条码号", "成色", "主石名称", "首饰类别", "总件重", "售价",
+	"销售工费方式", "销售工费", "进货金价", "进货工费方式", "进货工费"}
+
+// GET /api/doc/inbound/import-template —— 下载导入模板（带一行示例）
+func handleImportTemplate(w http.ResponseWriter, r *http.Request) {
+	if !requireHQ(w, r) {
+		return
+	}
+	rows := [][]string{importHeaders,
+		{"", "足金999.9", "", "金链", "10.55", "0", "按克", "58", "748", "按克", "12"},
+		{"ABC123", "A货", "和田玉", "吊坠", "6.20", "3999", "按件", "0", "0", "按件", "0"}}
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", `attachment; filename="import-template.xlsx"`)
+	_ = writeXLSX(w, "入库明细", rows)
+}
+
+// readXLSXFirstSheet 最小可用的 .xlsx 读取器：取第一张工作表为 [][]string。
+// 支持 Excel 常规保存的三种单元格：共享字符串(t="s")、内联字符串(inlineStr)、数值/直接值。
+func readXLSXFirstSheet(data []byte) ([][]string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("不是有效的 .xlsx 文件")
+	}
+	readFile := func(name string) []byte {
+		for _, f := range zr.File {
+			if f.Name == name {
+				rc, err := f.Open()
+				if err != nil {
+					return nil
+				}
+				b, _ := io.ReadAll(rc)
+				rc.Close()
+				return b
+			}
+		}
+		return nil
+	}
+	// 共享字符串表（可能不存在）
+	var shared []string
+	if b := readFile("xl/sharedStrings.xml"); b != nil {
+		var sst struct {
+			SI []struct {
+				T string `xml:"t"`
+				R []struct {
+					T string `xml:"t"`
+				} `xml:"r"`
+			} `xml:"si"`
+		}
+		if err := xml.Unmarshal(b, &sst); err != nil {
+			return nil, fmt.Errorf("共享字符串解析失败")
+		}
+		for _, si := range sst.SI {
+			s := si.T
+			for _, run := range si.R {
+				s += run.T
+			}
+			shared = append(shared, s)
+		}
+	}
+	// 第一张工作表
+	sheetName := "xl/worksheets/sheet1.xml"
+	if readFile(sheetName) == nil {
+		for _, f := range zr.File {
+			if strings.HasPrefix(f.Name, "xl/worksheets/") && strings.HasSuffix(f.Name, ".xml") {
+				sheetName = f.Name
+				break
+			}
+		}
+	}
+	b := readFile(sheetName)
+	if b == nil {
+		return nil, fmt.Errorf("文件里找不到工作表")
+	}
+	var ws struct {
+		Rows []struct {
+			Cells []struct {
+				Ref  string `xml:"r,attr"`
+				Type string `xml:"t,attr"`
+				V    string `xml:"v"`
+				IS   struct {
+					T string `xml:"t"`
+				} `xml:"is"`
+			} `xml:"c"`
+		} `xml:"sheetData>row"`
+	}
+	if err := xml.Unmarshal(b, &ws); err != nil {
+		return nil, fmt.Errorf("工作表解析失败")
+	}
+	colIndex := func(ref string) int { // "C7"→2
+		n := 0
+		for _, ch := range ref {
+			if ch >= 'A' && ch <= 'Z' {
+				n = n*26 + int(ch-'A') + 1
+			} else {
+				break
+			}
+		}
+		return n - 1
+	}
+	out := [][]string{}
+	for _, row := range ws.Rows {
+		cells := []string{}
+		for _, c := range row.Cells {
+			idx := colIndex(c.Ref)
+			if idx < 0 {
+				idx = len(cells)
+			}
+			for len(cells) <= idx {
+				cells = append(cells, "")
+			}
+			var val string
+			switch c.Type {
+			case "s":
+				i, err := strconv.Atoi(c.V)
+				if err == nil && i >= 0 && i < len(shared) {
+					val = shared[i]
+				}
+			case "inlineStr":
+				val = c.IS.T
+			default:
+				val = c.V
+			}
+			cells[idx] = strings.TrimSpace(val)
+		}
+		out = append(out, cells)
+	}
+	return out, nil
+}
+
+// POST /api/doc/inbound/import —— 多部件上传(file+category)；校验全过才建一张草稿
+func handleInboundImport(w http.ResponseWriter, r *http.Request) {
+	if !requireHQ(w, r) {
+		return
+	}
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeErr(w, 400, "上传解析失败: "+err.Error())
+		return
+	}
+	category := strings.TrimSpace(r.FormValue("category"))
+	var catOK bool
+	_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item WHERE dict_type='category' AND name=$1 AND enabled=true)`,
+		category).Scan(&catOK)
+	if !catOK {
+		writeErr(w, 400, "首饰大类不存在或已停用")
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 400, "没有收到文件")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 10<<20))
+	if err != nil {
+		writeErr(w, 500, "读取文件失败: "+err.Error())
+		return
+	}
+	table, err := readXLSXFirstSheet(data)
+	if err != nil {
+		writeErr(w, 400, err.Error()+"——请使用\"下载模板\"的格式")
+		return
+	}
+	if len(table) < 2 {
+		writeErr(w, 400, "文件里没有数据行（第一行是表头，数据从第二行开始）")
+		return
+	}
+	// 表头按名定位列（容忍列顺序变化与多余列）
+	col := map[string]int{}
+	for i, h := range table[0] {
+		col[strings.ReplaceAll(strings.ReplaceAll(h, " ", ""), "\n", "")] = i
+	}
+	need := []string{"成色", "首饰类别", "总件重"}
+	for _, h := range need {
+		if _, ok := col[h]; !ok {
+			writeErr(w, 400, fmt.Sprintf("模板缺少必需列「%s」——请使用\"下载模板\"的格式", h))
+			return
+		}
+	}
+	get := func(row []string, h string) string {
+		i, ok := col[h]
+		if !ok || i >= len(row) {
+			return ""
+		}
+		return row[i]
+	}
+	num := func(row []string, h string, excelRow int) (float64, error) {
+		s := get(row, h)
+		if s == "" {
+			return 0, nil
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, fmt.Errorf("第%d行「%s」不是数字：%s", excelRow, h, s)
+		}
+		return v, nil
+	}
+	if len(table)-1 > 500 {
+		writeErr(w, 400, "单次导入最多500行——请拆成多个文件")
+		return
+	}
+	lines := []DraftLine{}
+	for i, row := range table[1:] {
+		excelRow := i + 2 // Excel里的行号（1是表头）
+		empty := true
+		for _, c := range row {
+			if c != "" {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			continue
+		}
+		l := DraftLine{
+			Barcode:     get(row, "条码号"),
+			Purity:      get(row, "成色"),
+			StoneName:   get(row, "主石名称"),
+			JewelType:   get(row, "首饰类别"),
+			SaleFeeMode: get(row, "销售工费方式"),
+			CostFeeMode: get(row, "进货工费方式"),
+		}
+		var e error
+		if l.WeightG, e = num(row, "总件重", excelRow); e != nil {
+			writeErr(w, 400, e.Error()+"，整单未导入")
+			return
+		}
+		if l.Price, e = num(row, "售价", excelRow); e != nil {
+			writeErr(w, 400, e.Error()+"，整单未导入")
+			return
+		}
+		if l.SaleFee, e = num(row, "销售工费", excelRow); e != nil {
+			writeErr(w, 400, e.Error()+"，整单未导入")
+			return
+		}
+		if l.CostGoldPrice, e = num(row, "进货金价", excelRow); e != nil {
+			writeErr(w, 400, e.Error()+"，整单未导入")
+			return
+		}
+		if l.CostFee, e = num(row, "进货工费", excelRow); e != nil {
+			writeErr(w, 400, e.Error()+"，整单未导入")
+			return
+		}
+		lines = append(lines, l)
+	}
+	// 统一规范化校验（与手工录入同一套规则），报错带 Excel 行号
+	normalized, err := normalizeLines(lines)
+	if err != nil {
+		msg := err.Error()
+		// normalizeLines 的"第N行"是数据行序号，换算成 Excel 行号提示
+		writeErr(w, 400, msg+"（注：此处行号为数据行序号，Excel行号=序号+1），整单未导入")
+		return
+	}
+	// 已填条码逐个查重（确认时还有一道闸，这里提前拦住让行号可见）
+	for i, l := range normalized {
+		if l.Barcode == "" {
+			continue
+		}
+		var exists bool
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM item WHERE barcode=$1)`, l.Barcode).Scan(&exists)
+		if exists {
+			writeErr(w, 400, fmt.Sprintf("第%d行条码 %s 已存在于系统，整单未导入", i+2, l.Barcode))
+			return
+		}
+	}
+	// 全部通过 → 建一张草稿（走确认流程复核后才生成货品）
+	linesJSON, _ := json.Marshal(normalized)
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	today := time.Now().Format("20060102")
+	seq, err := nextSeq(tx, "RK", today)
+	if err != nil {
+		writeErr(w, 500, "单号发号失败: "+err.Error())
+		return
+	}
+	if seq > 99 {
+		writeErr(w, 400, "当日入库单号已满99张")
+		return
+	}
+	docNo := fmt.Sprintf("RK%s%02d", today, seq)
+	var docID int64
+	err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, category, maker_id, draft_lines)
+		VALUES ($1,'inbound','草稿',$2,$3,$4) RETURNING id`,
+		docNo, category, currentUID(r), linesJSON).Scan(&docID)
+	if err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿", "count": len(normalized)})
+}
+
 // GET /api/doc/inbound/labels?id=N —— 导出该入库单货品的标签数据（仅已确认单）
 func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 	if !requireHQ(w, r) {
@@ -5394,6 +5698,8 @@ func main() {
 	mux.HandleFunc("POST /api/doc/inbound/delete", withAuth(handleInboundDelete))
 	mux.HandleFunc("GET /api/doc/inbound", withAuth(handleInboundList))
 	mux.HandleFunc("GET /api/doc/inbound/labels", withAuth(handleInboundLabels))
+	mux.HandleFunc("GET /api/doc/inbound/import-template", withAuth(handleImportTemplate))
+	mux.HandleFunc("POST /api/doc/inbound/import", withAuth(handleInboundImport))
 	mux.HandleFunc("POST /api/doc/outbound/save", withAuth(handleOutboundSave))
 	mux.HandleFunc("POST /api/doc/outbound/confirm", withAuth(handleOutboundConfirm))
 	mux.HandleFunc("POST /api/doc/outbound/unconfirm", withAuth(handleOutboundUnconfirm))
