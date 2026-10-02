@@ -27,6 +27,11 @@ interface Item {
   price?: number
   status: string
   location?: string
+  saleFeeMode?: string
+  saleFee?: number
+  costGoldPrice?: number
+  costFeeMode?: string
+  costFee?: number
 }
 const items = ref<Item[]>([])
 const itemsTotal = ref(0)
@@ -55,6 +60,11 @@ interface Line {
   purity: string
   weightG: number | null
   price: number | null
+  saleFeeMode: string
+  saleFee: number | null
+  costGoldPrice: number | null
+  costFeeMode: string
+  costFee: number | null
 }
 // ===== 金价 =====
 interface GoldPrice {
@@ -110,6 +120,8 @@ interface SaleLine {
   price: number
   mode: string
   soldPrice: number | null
+  saleFeeMode?: string
+  saleFee?: number
 }
 interface PayLine {
   method: string
@@ -221,10 +233,11 @@ function slFillPay(p: PayLine) {
 function goldRateOf(purity: string): number {
   return goldPrices.value.find(g => g.purity === purity)?.retailPrice ?? 0
 }
-// 建议价：标签价→售价；变金价→克重×当前金价
+// 建议价：标签价→售价；变金价→克重×金价+销售工费，四舍五入到元（JMP同款口径）
 function suggestPrice(l: SaleLine): number {
   if (l.mode === '标签价') return l.price
-  return Math.round(l.weightG * goldRateOf(l.purity) * 100) / 100
+  const fee = (l.saleFeeMode === '按件') ? (l.saleFee ?? 0) : l.weightG * (l.saleFee ?? 0)
+  return Math.round(l.weightG * goldRateOf(l.purity) + fee)
 }
 function slModeChanged(l: SaleLine) {
   l.soldPrice = suggestPrice(l)
@@ -252,6 +265,7 @@ function slAdd() {
   const line: SaleLine = {
     barcode: bc, name: it.name, purity: it.purity,
     weightG: it.weightG, price: it.price ?? 0, mode, soldPrice: null,
+    saleFeeMode: it.saleFeeMode || '按克', saleFee: it.saleFee ?? 0,
   }
   line.soldPrice = suggestPrice(line)
   if (mode === '变金价' && goldRateOf(it.purity) <= 0) {
@@ -1342,7 +1356,8 @@ async function changePwd() {
 const editingId = ref(0) // 0=新单；>0=正在编辑的草稿id
 const editingNo = ref('')
 const category = ref('黄金')
-const lines = ref<Line[]>([{ barcode: '', name: '', purity: '足金999.9', weightG: null }])
+const lines = ref<Line[]>([{ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null,
+  saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null }])
 
 function resetForm() {
   editingId.value = 0
@@ -1441,7 +1456,8 @@ async function exportLabels(d: Doc) {
 }
 
 function addLine() {
-  lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null })
+  lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null,
+    saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null })
 }
 function removeLine(i: number) {
   lines.value.splice(i, 1)
@@ -1457,6 +1473,11 @@ function payload() {
       purity: l.purity,
       weightG: Number(l.weightG) || 0,
       price: Number(l.price) || 0,
+      saleFeeMode: l.saleFeeMode,
+      saleFee: Number(l.saleFee) || 0,
+      costGoldPrice: Number(l.costGoldPrice) || 0,
+      costFeeMode: l.costFeeMode,
+      costFee: Number(l.costFee) || 0,
     })),
   }
 }
@@ -1542,6 +1563,11 @@ function editDoc(d: Doc) {
     purity: it.purity,
     weightG: it.weightG,
     price: it.price ?? 0,
+    saleFeeMode: it.saleFeeMode || '按克',
+    saleFee: it.saleFee ?? 0,
+    costGoldPrice: it.costGoldPrice ?? 0,
+    costFeeMode: it.costFeeMode || '按克',
+    costFee: it.costFee ?? 0,
   }))
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -2303,7 +2329,7 @@ function editDoc(d: Doc) {
         </div>
         <table>
           <thead>
-            <tr><th>#</th><th>条码号(留空确认时自动生成)</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th>售价(¥,按克可填0)</th><th></th></tr>
+            <tr><th>#</th><th>条码号(留空自动生成)</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>销售工费</th><th>进货金价</th><th>进货工费</th><th></th></tr>
           </thead>
           <tbody>
             <tr v-for="(l, i) in lines" :key="i">
@@ -2315,8 +2341,17 @@ function editDoc(d: Doc) {
                   <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
                 </select>
               </td>
-              <td><input v-model.number="l.weightG" type="number" step="0.01" /></td>
-              <td><input v-model.number="l.price" type="number" step="1" placeholder="0" /></td>
+              <td><input v-model.number="l.weightG" type="number" step="0.01" style="width:80px" /></td>
+              <td><input v-model.number="l.price" type="number" step="1" placeholder="0" style="width:80px" /></td>
+              <td>
+                <select v-model="l.saleFeeMode" style="width:64px"><option>按克</option><option>按件</option></select>
+                <input v-model.number="l.saleFee" type="number" step="0.5" placeholder="0" style="width:64px" />
+              </td>
+              <td><input v-model.number="l.costGoldPrice" type="number" step="0.01" placeholder="0" style="width:80px" /></td>
+              <td>
+                <select v-model="l.costFeeMode" style="width:64px"><option>按克</option><option>按件</option></select>
+                <input v-model.number="l.costFee" type="number" step="0.5" placeholder="0" style="width:64px" />
+              </td>
               <td><button class="mini" @click="removeLine(i)" :disabled="lines.length === 1">删行</button></td>
             </tr>
           </tbody>
@@ -2326,7 +2361,7 @@ function editDoc(d: Doc) {
           <button class="gray" @click="saveDraft">保存草稿</button>
           <button @click="saveAndConfirm">保存并确认</button>
         </div>
-        <p class="hint">草稿不动库存；点"确认"的那一刻才生成货品件。</p>
+        <p class="hint">草稿不动库存；点"确认"的那一刻才生成货品件。按克货：售价可填0，销售时按 克重×金价+销售工费；进货金价/工费是成本（仅管理员可见），供将来毛利核算。</p>
       </section>
 
       <!-- 单据列表 -->
@@ -2552,7 +2587,7 @@ function editDoc(d: Doc) {
         <p class="ok">共 {{ itemsTotal }} 件 · 合计克重 {{ itemsSumW.toFixed(2) }} g</p>
         <table>
           <thead>
-            <tr><th>条码号</th><th>首饰名称</th><th>大类</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>位置</th><th>状态</th></tr>
+            <tr><th>条码号</th><th>首饰名称</th><th>大类</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>销售工费</th><th>位置</th><th>状态</th></tr>
           </thead>
           <tbody>
             <tr v-for="it in items" :key="it.id">
@@ -2562,6 +2597,7 @@ function editDoc(d: Doc) {
               <td>{{ it.purity }}</td>
               <td>{{ (it.weightG ?? 0).toFixed(2) }}</td>
               <td>{{ (it.price ?? 0) > 0 ? (it.price ?? 0).toFixed(0) : '—' }}</td>
+              <td>{{ (it.saleFee ?? 0) > 0 ? `${it.saleFee}/${it.saleFeeMode === '按件' ? '件' : '克'}` : '—' }}</td>
               <td>{{ it.location ?? '总库' }}</td>
               <td>{{ it.status }}</td>
             </tr>

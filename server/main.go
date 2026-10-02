@@ -51,6 +51,12 @@ type Item struct {
 	Price    float64 `json:"price"`
 	Status   string  `json:"status"`
 	Location string  `json:"location,omitempty"` // v0.18：总库 或 分销商名
+	// v0.27 计价模型
+	SaleFeeMode   string  `json:"saleFeeMode,omitempty"`
+	SaleFee       float64 `json:"saleFee,omitempty"`
+	CostGoldPrice float64 `json:"costGoldPrice,omitempty"` // 成本字段仅管理员可见
+	CostFeeMode   string  `json:"costFeeMode,omitempty"`
+	CostFee       float64 `json:"costFee,omitempty"`
 }
 
 // DraftLine 草稿明细行（存进 doc.draft_lines 的 JSON 结构，字段名与前端一致）
@@ -60,6 +66,20 @@ type DraftLine struct {
 	Purity  string  `json:"purity"`
 	WeightG float64 `json:"weightG"`
 	Price   float64 `json:"price"` // 售价(标签价)，0=未定价
+	// v0.27 计价模型：销售工费（变金价=克重×金价+工费）与进货成本
+	SaleFeeMode   string  `json:"saleFeeMode,omitempty"` // 按克/按件
+	SaleFee       float64 `json:"saleFee,omitempty"`
+	CostGoldPrice float64 `json:"costGoldPrice,omitempty"` // 进货金价(元/克)
+	CostFeeMode   string  `json:"costFeeMode,omitempty"`
+	CostFee       float64 `json:"costFee,omitempty"`
+}
+
+// feeAmount 工费金额：按克=克重×单价；按件=固定额
+func feeAmount(mode string, fee, weightG float64) float64 {
+	if mode == "按件" {
+		return fee
+	}
+	return round2(weightG * fee)
 }
 
 type InboundDoc struct {
@@ -255,6 +275,22 @@ func normalizeLines(lines []DraftLine) ([]DraftLine, error) {
 		}
 		if l.Price < 0 {
 			return nil, fmt.Errorf("第%d行售价不能为负数", i+1)
+		}
+		// v0.27：工费与成本校验（方式默认按克；金额不得为负）
+		if l.SaleFeeMode == "" {
+			l.SaleFeeMode = "按克"
+		}
+		if l.CostFeeMode == "" {
+			l.CostFeeMode = "按克"
+		}
+		if l.SaleFeeMode != "按克" && l.SaleFeeMode != "按件" {
+			return nil, fmt.Errorf("第%d行销售工费方式必须是 按克 或 按件", i+1)
+		}
+		if l.CostFeeMode != "按克" && l.CostFeeMode != "按件" {
+			return nil, fmt.Errorf("第%d行进货工费方式必须是 按克 或 按件", i+1)
+		}
+		if l.SaleFee < 0 || l.CostFee < 0 || l.CostGoldPrice < 0 {
+			return nil, fmt.Errorf("第%d行工费/进货金价不能为负数", i+1)
 		}
 		out = append(out, l)
 	}
@@ -1843,6 +1879,9 @@ type SaleLine struct {
 	Price     float64 `json:"price"`     // 标签价快照(加入时)
 	Mode      string  `json:"mode"`      // 标签价 / 变金价
 	SoldPrice float64 `json:"soldPrice"` // 实售价(可议价)
+	// v0.27：销售工费快照（变金价参考价 = 克重×金价 + 工费，四舍五入到元）
+	SaleFeeMode string  `json:"saleFeeMode,omitempty"`
+	SaleFee     float64 `json:"saleFee,omitempty"`
 }
 
 // OldLine 旧料行（v0.24 以旧换新/旧料回收）：旧料不是系统货品，没有条码，
@@ -2025,8 +2064,9 @@ func handleSaleSave(w http.ResponseWriter, r *http.Request) {
 	// 逐行：读取货品资料 → 计价规则校验 → 条件更新锁定（抢不到就整单失败）
 	for i := range lines {
 		sl := &lines[i]
-		err := tx.QueryRow(`SELECT name, purity, weight_g, price FROM item WHERE barcode=$1`, sl.Barcode).
-			Scan(&sl.Name, &sl.Purity, &sl.WeightG, &sl.Price)
+		err := tx.QueryRow(`SELECT name, purity, weight_g, price, labor_fee_mode, labor_fee
+			FROM item WHERE barcode=$1`, sl.Barcode).
+			Scan(&sl.Name, &sl.Purity, &sl.WeightG, &sl.Price, &sl.SaleFeeMode, &sl.SaleFee)
 		if err == sql.ErrNoRows {
 			writeErr(w, 400, fmt.Sprintf("条码 %s 不存在", sl.Barcode))
 			return
@@ -2240,13 +2280,16 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 
 	rates := map[string]float64{} // 本单用到的各成色确认时金价
 	type snapLine struct {
-		Barcode   string  `json:"barcode"`
-		Mode      string  `json:"mode"`
-		WeightG   float64 `json:"weightG"`
+		Barcode    string  `json:"barcode"`
+		Mode       string  `json:"mode"`
+		WeightG    float64 `json:"weightG"`
 		LabelPrice float64 `json:"labelPrice"`
-		GoldRate  float64 `json:"goldRate"`  // 变金价行：确认时金价
-		RefPrice  float64 `json:"refPrice"`  // 系统参考价
-		SoldPrice float64 `json:"soldPrice"` // 实际成交价
+		GoldRate   float64 `json:"goldRate"`  // 变金价行：确认时金价
+		FeeMode    string  `json:"feeMode"`   // v0.27：销售工费方式
+		Fee        float64 `json:"fee"`       // 工费单价（按克=元/克；按件=元/件）
+		FeeAmt     float64 `json:"feeAmt"`    // 工费金额
+		RefPrice   float64 `json:"refPrice"`  // 系统参考价 = 克重×金价 + 工费（四舍五入到元）
+		SoldPrice  float64 `json:"soldPrice"` // 实际成交价
 	}
 	snaps := []snapLine{}
 	var total float64
@@ -2276,7 +2319,8 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sp := snapLine{Barcode: l.Barcode, Mode: l.Mode, WeightG: l.WeightG,
-			LabelPrice: l.Price, SoldPrice: l.SoldPrice}
+			LabelPrice: l.Price, SoldPrice: l.SoldPrice,
+			FeeMode: l.SaleFeeMode, Fee: l.SaleFee}
 		if l.Mode == "变金价" {
 			rate, ok := rates[l.Purity]
 			if !ok {
@@ -2293,7 +2337,9 @@ func handleSaleConfirm(w http.ResponseWriter, r *http.Request) {
 				rates[l.Purity] = rate
 			}
 			sp.GoldRate = rate
-			sp.RefPrice = round2(l.WeightG * rate)
+			sp.FeeAmt = feeAmount(l.SaleFeeMode, l.SaleFee, l.WeightG)
+			// JMP同款口径：参考价四舍五入到元（2.46×(1169+78)=3067.62→3068）
+			sp.RefPrice = math.Round(l.WeightG*rate + sp.FeeAmt)
 		} else {
 			sp.RefPrice = l.Price
 		}
@@ -4663,7 +4709,8 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(`SELECT it.id, it.barcode, it.name, it.category, it.purity, it.weight_g, it.price, it.status,
-		CASE WHEN it.location_type='总库' THEN '总库' ELSE COALESCE(dst.name,'未知分销商') END
+		CASE WHEN it.location_type='总库' THEN '总库' ELSE COALESCE(dst.name,'未知分销商') END,
+		it.labor_fee_mode, it.labor_fee, it.cost_gold_price, it.cost_fee_mode, it.cost_fee
 		FROM item it LEFT JOIN distributor dst ON dst.id = it.distributor_id
 		WHERE `+cond+` ORDER BY it.id DESC LIMIT 500`, args...)
 	if err != nil {
@@ -4671,12 +4718,17 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
+	isAdm := currentIsAdmin(r)
 	list := []Item{}
 	for rows.Next() {
 		var it Item
-		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Category, &it.Purity, &it.WeightG, &it.Price, &it.Status, &it.Location); err != nil {
+		if err := rows.Scan(&it.ID, &it.Barcode, &it.Name, &it.Category, &it.Purity, &it.WeightG, &it.Price, &it.Status, &it.Location,
+			&it.SaleFeeMode, &it.SaleFee, &it.CostGoldPrice, &it.CostFeeMode, &it.CostFee); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
+		}
+		if !isAdm { // 进货成本是机密，非管理员不可见（前端隐藏是体验，这里才是安全）
+			it.CostGoldPrice, it.CostFee, it.CostFeeMode = 0, 0, ""
 		}
 		list = append(list, it)
 	}
@@ -4793,7 +4845,8 @@ func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "只有已确认的入库单才能导出标签（草稿还没发条码号）")
 		return
 	}
-	rows, err := db.Query(`SELECT it.barcode, it.name, it.category, it.purity, it.weight_g, it.price
+	rows, err := db.Query(`SELECT it.barcode, it.name, it.category, it.purity, it.weight_g, it.price,
+		it.labor_fee_mode, it.labor_fee
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, id)
 	if err != nil {
@@ -4807,9 +4860,9 @@ func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := [][]string{labelHeaders}
 	for rows.Next() {
-		var barcode, name, category, purity string
-		var weight, price float64
-		if err := rows.Scan(&barcode, &name, &category, &purity, &weight, &price); err != nil {
+		var barcode, name, category, purity, feeMode string
+		var weight, price, fee float64
+		if err := rows.Scan(&barcode, &name, &category, &purity, &weight, &price, &feeMode, &fee); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
 		}
@@ -4822,6 +4875,10 @@ func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 		row[col["含配金重"]] = fmt.Sprintf("%.4f", weight)
 		row[col["总件重"]] = fmt.Sprintf("%.4f", weight)
 		row[col["售价"]] = fmt.Sprintf("%g", price)
+		row[col["销售工费方式"]] = feeMode
+		if fee > 0 {
+			row[col["销售工费"]] = fmt.Sprintf("%g", fee)
+		}
 		data = append(data, row)
 	}
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -4996,9 +5053,11 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		var itemID int64
 		err = tx.QueryRow(`
-			INSERT INTO item (barcode, name, category, purity, weight_g, price, status)
-			VALUES ($1,$2,$3,$4,$5,$6,'在库') RETURNING id`,
-			bc, l.Name, category, l.Purity, l.WeightG, l.Price).Scan(&itemID)
+			INSERT INTO item (barcode, name, category, purity, weight_g, price, status,
+				labor_fee_mode, labor_fee, cost_gold_price, cost_fee_mode, cost_fee)
+			VALUES ($1,$2,$3,$4,$5,$6,'在库',$7,$8,$9,$10,$11) RETURNING id`,
+			bc, l.Name, category, l.Purity, l.WeightG, l.Price,
+			l.SaleFeeMode, l.SaleFee, l.CostGoldPrice, l.CostFeeMode, l.CostFee).Scan(&itemID)
 		if err != nil {
 			writeErr(w, 500, fmt.Sprintf("第%d行写入失败: %s", i+1, err.Error()))
 			return
@@ -5070,7 +5129,8 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	// 下游依赖校验：本单所有件必须仍"在库"且在总库。
 	// （将来有了销售/分销单，被引用的件状态会变，这里就会拦住并指明哪件被占用。）
 	rows, err := tx.Query(`
-		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g, it.price
+		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g, it.price,
+			it.labor_fee_mode, it.labor_fee, it.cost_gold_price, it.cost_fee_mode, it.cost_fee
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
 	if err != nil {
@@ -5085,9 +5145,9 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	var rebuilt []DraftLine // 从真实货品件重建草稿明细（兼容老单据草稿字段为空的情况）
 	for rows.Next() {
 		var id int64
-		var bc, st, name, purity string
-		var wg, pr float64
-		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg, &pr); err != nil {
+		var bc, st, name, purity, sfm, cfm string
+		var wg, pr, sf, cgp, cf float64
+		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg, &pr, &sfm, &sf, &cgp, &cfm, &cf); err != nil {
 			rows.Close()
 			writeErr(w, 500, "明细读取失败: "+err.Error())
 			return
@@ -5098,7 +5158,8 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		itemRefs = append(itemRefs, ref{id, bc})
-		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg, Price: pr})
+		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg, Price: pr,
+			SaleFeeMode: sfm, SaleFee: sf, CostGoldPrice: cgp, CostFeeMode: cfm, CostFee: cf})
 	}
 	rows.Close()
 	if len(rebuilt) > 0 {
@@ -5196,7 +5257,9 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(drafts[docs[i].ID], &lines)
 			for _, l := range lines {
 				docs[i].Items = append(docs[i].Items, Item{Barcode: l.Barcode, Name: l.Name,
-					Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: "草稿"})
+					Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: "草稿",
+					SaleFeeMode: l.SaleFeeMode, SaleFee: l.SaleFee,
+					CostGoldPrice: l.CostGoldPrice, CostFeeMode: l.CostFeeMode, CostFee: l.CostFee})
 			}
 			continue
 		}
