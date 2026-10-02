@@ -115,6 +115,13 @@ export const api = {
   transferDelete: (id: number) => request('POST', '/api/doc/transfer/delete', { id }),
   transferList: () => request('GET', '/api/doc/transfer'),
 
+  // 旧料回收单（v0.25）
+  recycleSave: (payload: unknown) => request('POST', '/api/doc/recycle/save', payload),
+  recycleConfirm: (id: number) => request('POST', '/api/doc/recycle/confirm', { id }),
+  recycleUnconfirm: (id: number) => request('POST', '/api/doc/recycle/unconfirm', { id }),
+  recycleDelete: (id: number) => request('POST', '/api/doc/recycle/delete', { id }),
+  recycleList: () => request('GET', '/api/doc/recycle'),
+
   // 盘点单（v0.23）
   stocktakeSave: (payload: unknown) => request('POST', '/api/doc/stocktake/save', payload),
   stocktakeConfirm: (id: number) => request('POST', '/api/doc/stocktake/confirm', { id }),

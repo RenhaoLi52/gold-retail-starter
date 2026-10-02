@@ -4204,6 +4204,421 @@ func handleStocktakeList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
 }
 
+// ===== 纯旧料回收单（v0.25，HS） =====
+// 顾客不买东西、单纯把旧料卖给店里，店里付钱。
+// 旧料行复用 OldLine（全部按回收价，无换新部分）；提成走"旧料回收"规则；
+// 付款复用 pay_method 字典（方向：付给顾客）；反确认限当日（付出去的钱是财务事实）。
+// 不动库存（旧料入库=旧料库，另章）。
+
+// POST /api/doc/recycle/save {id?, salespersonIds, payments, lines:[{category,purity,weightG}]}
+func handleRecycleSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID             int64     `json:"id"`
+		SalespersonIDs []int64   `json:"salespersonIds"`
+		Payments       []PayLine `json:"payments"`
+		Lines          []OldLine `json:"lines"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Lines) == 0 {
+		writeErr(w, 400, "参数错误：至少要有一行旧料")
+		return
+	}
+	if err := validatePayments(req.Payments); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	for i, ol := range req.Lines {
+		var catOK, puOK bool
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item WHERE dict_type='category' AND name=$1 AND enabled=true)`, ol.Category).Scan(&catOK)
+		_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM dict_item WHERE dict_type='purity' AND name=$1 AND enabled=true)`, ol.Purity).Scan(&puOK)
+		if !catOK {
+			writeErr(w, 400, fmt.Sprintf("第%d行大类「%s」不存在或已停用", i+1, ol.Category))
+			return
+		}
+		if !puOK {
+			writeErr(w, 400, fmt.Sprintf("第%d行成色「%s」不存在或已停用", i+1, ol.Purity))
+			return
+		}
+		if ol.WeightG <= 0 {
+			writeErr(w, 400, fmt.Sprintf("第%d行克重必须大于0", i+1))
+			return
+		}
+	}
+	spSeen := map[int64]bool{}
+	spIDs := []int64{}
+	for _, id := range req.SalespersonIDs {
+		if id > 0 && !spSeen[id] {
+			spSeen[id] = true
+			spIDs = append(spIDs, id)
+		}
+	}
+	if len(spIDs) > 3 {
+		writeErr(w, 400, "售货员最多3人")
+		return
+	}
+	spIDsJSON, _ := json.Marshal(spIDs)
+	if req.Payments == nil {
+		req.Payments = []PayLine{}
+	}
+	paysJSON, _ := json.Marshal(req.Payments)
+	linesJSON, _ := json.Marshal(req.Lines)
+	store := currentStore(r)
+
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	if req.ID == 0 {
+		today := time.Now().Format("20060102")
+		seq, err := nextSeq(tx, "HS", today)
+		if err != nil {
+			writeErr(w, 500, "单号发号失败: "+err.Error())
+			return
+		}
+		if seq > 99 {
+			writeErr(w, 400, "当日回收单号已满99张")
+			return
+		}
+		docNo := fmt.Sprintf("HS%s%02d", today, seq)
+		var docID int64
+		err = tx.QueryRow(`INSERT INTO doc (doc_no, doc_type, status, maker_id, old_lines, salesperson_ids, payments, distributor_id)
+			VALUES ($1,'recycle','草稿',$2,$3,$4,$5,$6) RETURNING id`,
+			docNo, currentUID(r), linesJSON, spIDsJSON, paysJSON, nullableID(store)).Scan(&docID)
+		if err != nil {
+			writeErr(w, 500, "保存失败: "+err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, 500, "提交失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"id": docID, "docNo": docNo, "status": "草稿"})
+		return
+	}
+	var docStore sql.NullInt64
+	err = tx.QueryRow(`SELECT distributor_id FROM doc
+		WHERE id=$1 AND doc_type='recycle' AND status='草稿' FOR UPDATE`, req.ID).Scan(&docStore)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, "该单据不是草稿状态（可能已被确认或删除），请刷新")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	if store != 0 && docStore.Int64 != store {
+		writeErr(w, 403, "不能操作其他门店的单据")
+		return
+	}
+	if _, err := tx.Exec(`UPDATE doc SET old_lines=$1, salesperson_ids=$2, payments=$3 WHERE id=$4`,
+		linesJSON, spIDsJSON, paysJSON, req.ID); err != nil {
+		writeErr(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/recycle/confirm {id} —— 回收价快照+应付校验+提成入账，一个事务
+func handleRecycleConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := tx.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='recycle'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := tx.Exec(`UPDATE doc SET status='已确认', confirmed_at=now()
+		WHERE id=$1 AND doc_type='recycle' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "确认失败：单据不存在或已被他人确认，请刷新")
+		return
+	}
+	var linesJSON, spIDsJSON, paysJSON []byte
+	var docStore sql.NullInt64
+	if err := tx.QueryRow(`SELECT old_lines, salesperson_ids, payments, distributor_id
+		FROM doc WHERE id=$1`, req.ID).Scan(&linesJSON, &spIDsJSON, &paysJSON, &docStore); err != nil {
+		writeErr(w, 500, "读取单据失败: "+err.Error())
+		return
+	}
+	var lines []OldLine
+	if err := json.Unmarshal(linesJSON, &lines); err != nil || len(lines) == 0 {
+		writeErr(w, 400, "没有旧料明细，无法确认")
+		return
+	}
+	// 售货员校验（回收给提成，必填）：在职且归属与单据门店一致
+	var spIDs []int64
+	_ = json.Unmarshal(spIDsJSON, &spIDs)
+	if len(spIDs) == 0 {
+		writeErr(w, 400, "请先选择售货员再确认")
+		return
+	}
+	sps := []spInfo{}
+	for _, id := range spIDs {
+		s, err := loadSalesperson(tx, id)
+		if err != nil {
+			writeErr(w, 400, "售货员不存在，请重新选择")
+			return
+		}
+		if !s.Enabled {
+			writeErr(w, 400, fmt.Sprintf("售货员「%s」已停用，请重新选择", s.Name))
+			return
+		}
+		if s.StoreID != docStore.Int64 {
+			writeErr(w, 400, fmt.Sprintf("售货员「%s」属于「%s」，不能在「%s」的回收单上记提成",
+				s.Name, locName(tx, s.StoreID), locName(tx, docStore.Int64)))
+			return
+		}
+		sps = append(sps, s)
+	}
+	var mgr *spInfo
+	{
+		var m spInfo
+		var did sql.NullInt64
+		var e error
+		if docStore.Int64 == 0 {
+			e = tx.QueryRow(`SELECT id, name, distributor_id, role, manager_rate, enabled FROM salesperson
+				WHERE role='店长' AND enabled=true AND distributor_id IS NULL`).
+				Scan(&m.ID, &m.Name, &did, &m.Role, &m.ManagerRate, &m.Enabled)
+		} else {
+			e = tx.QueryRow(`SELECT id, name, distributor_id, role, manager_rate, enabled FROM salesperson
+				WHERE role='店长' AND enabled=true AND distributor_id=$1`, docStore.Int64).
+				Scan(&m.ID, &m.Name, &did, &m.Role, &m.ManagerRate, &m.Enabled)
+		}
+		if e == nil {
+			m.StoreID = did.Int64
+			mgr = &m
+		}
+	}
+	// 逐行：回收价快照 + 应付累计 + 提成入账
+	rates := map[string]float64{}
+	var total float64
+	for i := range lines {
+		ol := &lines[i]
+		var rp float64
+		err := tx.QueryRow(`SELECT recycle_price FROM gold_price
+			WHERE purity=$1 ORDER BY id DESC LIMIT 1`, ol.Purity).Scan(&rp)
+		if err == sql.ErrNoRows || rp <= 0 {
+			writeErr(w, 400, fmt.Sprintf("成色「%s」未发布回收价，整单未确认", ol.Purity))
+			return
+		}
+		if err != nil {
+			writeErr(w, 500, "金价查询失败: "+err.Error())
+			return
+		}
+		ol.TradeG, ol.RecycleG, ol.TradePrice, ol.RecyclePrice = 0, ol.WeightG, 0, rp
+		ol.Credit = round2(ol.WeightG * rp)
+		rates[ol.Purity] = rp
+		total += ol.Credit
+		c, e := oldCommission(tx, ol.Category, "旧料回收", ol.WeightG, ol.Credit)
+		if e != nil {
+			writeErr(w, 500, "提成规则查询失败: "+e.Error())
+			return
+		}
+		if e := postCommission(tx, req.ID, "旧料", "旧料回收", c, sps, mgr); e != nil {
+			writeErr(w, 500, "提成入账失败: "+e.Error())
+			return
+		}
+	}
+	total = round2(total)
+	// 付款校验：付给顾客的钱必须分毫不差
+	var pays []PayLine
+	_ = json.Unmarshal(paysJSON, &pays)
+	if len(pays) == 0 {
+		writeErr(w, 400, fmt.Sprintf("应付顾客 ¥%.2f——请先录入付款方式再确认", total))
+		return
+	}
+	if err := validatePayments(pays); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	var paySum float64
+	for _, p := range pays {
+		var en bool
+		err := tx.QueryRow(`SELECT enabled FROM dict_item WHERE dict_type='pay_method' AND name=$1`,
+			p.Method).Scan(&en)
+		if err != nil || !en {
+			writeErr(w, 400, fmt.Sprintf("付款方式「%s」不存在或已停用", p.Method))
+			return
+		}
+		paySum += p.Amount
+	}
+	if round2(paySum) != total {
+		writeErr(w, 400, fmt.Sprintf("付款合计 ¥%.2f 与应付顾客 ¥%.2f 不一致，整单未确认", paySum, total))
+		return
+	}
+	snapshot, _ := json.Marshal(map[string]any{"recycleRates": rates, "oldLines": lines, "payout": total})
+	processed, _ := json.Marshal(lines)
+	if _, err := tx.Exec(`UPDATE doc SET total_amount=$1, gold_price_snapshot=$2, old_lines=$3 WHERE id=$4`,
+		total, snapshot, processed, req.ID); err != nil {
+		writeErr(w, 500, "写入合计失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "已确认", "payout": total})
+}
+
+// POST /api/doc/recycle/unconfirm {id} —— 限当日；撤销提成
+func handleRecycleUnconfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		writeErr(w, 500, "开启事务失败: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := tx.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='recycle'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := tx.Exec(`UPDATE doc SET status='草稿', confirmed_at=NULL, total_amount=0, gold_price_snapshot=NULL
+		WHERE id=$1 AND doc_type='recycle' AND status='已确认'
+		AND confirmed_at::date = CURRENT_DATE`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "反确认失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "反确认失败：单据不存在、不是已确认状态，或已跨日")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM commission_flow WHERE doc_id=$1`, req.ID); err != nil {
+		writeErr(w, 500, "撤销提成失败: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "提交失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": req.ID, "status": "草稿"})
+}
+
+// POST /api/doc/recycle/delete {id}
+func handleRecycleDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	if store := currentStore(r); store != 0 {
+		var ds sql.NullInt64
+		if err := db.QueryRow(`SELECT distributor_id FROM doc WHERE id=$1 AND doc_type='recycle'`,
+			req.ID).Scan(&ds); err != nil || ds.Int64 != store {
+			writeErr(w, 403, "不能操作其他门店的单据")
+			return
+		}
+	}
+	res, err := db.Exec(`DELETE FROM doc WHERE id=$1 AND doc_type='recycle' AND status='草稿'`, req.ID)
+	if err != nil {
+		writeErr(w, 500, "删除失败: "+err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 400, "删除失败：只有草稿可以删除（已确认的请先反确认）")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": req.ID})
+}
+
+// GET /api/doc/recycle —— 回收单列表（门店只见本店）
+func handleRecycleList(w http.ResponseWriter, r *http.Request) {
+	cond, args := "", []any{}
+	if store := currentStore(r); store != 0 {
+		cond, args = " AND d.distributor_id=$1", []any{store}
+	}
+	spNames := map[int64]string{}
+	if nrows, err := db.Query(`SELECT id, name FROM salesperson`); err == nil {
+		for nrows.Next() {
+			var id int64
+			var n string
+			_ = nrows.Scan(&id, &n)
+			spNames[id] = n
+		}
+		nrows.Close()
+	}
+	rows, err := db.Query(`SELECT d.id, d.doc_no, d.status, d.old_lines, d.total_amount,
+		d.salesperson_ids, d.payments, to_char(d.created_at,'YYYY-MM-DD HH24:MI:SS')
+		FROM doc d WHERE d.doc_type='recycle'`+cond+` ORDER BY d.id DESC LIMIT 20`, args...)
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	type HDoc struct {
+		ID              int64     `json:"id"`
+		DocNo           string    `json:"docNo"`
+		Status          string    `json:"status"`
+		Payout          float64   `json:"payout"`
+		SalespersonIDs  []int64   `json:"salespersonIds"`
+		SalespersonName string    `json:"salespersonName"`
+		Payments        []PayLine `json:"payments"`
+		Lines           []OldLine `json:"lines"`
+		MadeAt          string    `json:"madeAt"`
+	}
+	docs := []HDoc{}
+	for rows.Next() {
+		var d HDoc
+		var dl, spj, pj []byte
+		if err := rows.Scan(&d.ID, &d.DocNo, &d.Status, &dl, &d.Payout, &spj, &pj, &d.MadeAt); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		d.SalespersonIDs = []int64{}
+		_ = json.Unmarshal(spj, &d.SalespersonIDs)
+		names := []string{}
+		for _, id := range d.SalespersonIDs {
+			if n, ok := spNames[id]; ok {
+				names = append(names, n)
+			}
+		}
+		d.SalespersonName = strings.Join(names, "、")
+		d.Lines = []OldLine{}
+		_ = json.Unmarshal(dl, &d.Lines)
+		d.Payments = []PayLine{}
+		_ = json.Unmarshal(pj, &d.Payments)
+		docs = append(docs, d)
+	}
+	writeJSON(w, 200, map[string]any{"list": docs, "total": len(docs)})
+}
+
 func handleItems(w http.ResponseWriter, r *http.Request) {
 	// 查询参数：status(状态) category(大类) q(条码前缀或名称模糊) —— 都可选
 	q := r.URL.Query()
@@ -4732,6 +5147,11 @@ func main() {
 	mux.HandleFunc("POST /api/doc/stocktake/unconfirm", withAuth(handleStocktakeUnconfirm))
 	mux.HandleFunc("POST /api/doc/stocktake/delete", withAuth(handleStocktakeDelete))
 	mux.HandleFunc("GET /api/doc/stocktake", withAuth(handleStocktakeList))
+	mux.HandleFunc("POST /api/doc/recycle/save", withAuth(handleRecycleSave))
+	mux.HandleFunc("POST /api/doc/recycle/confirm", withAuth(handleRecycleConfirm))
+	mux.HandleFunc("POST /api/doc/recycle/unconfirm", withAuth(handleRecycleUnconfirm))
+	mux.HandleFunc("POST /api/doc/recycle/delete", withAuth(handleRecycleDelete))
+	mux.HandleFunc("GET /api/doc/recycle", withAuth(handleRecycleList))
 
 	fmt.Println("后端已启动: http://localhost:8080/api/health  (Ctrl+C 停止)")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

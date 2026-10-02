@@ -554,6 +554,134 @@ async function loadReport() {
   }
 }
 
+// ===== 纯旧料回收单（v0.25） =====
+interface HDoc {
+  id: number
+  docNo: string
+  status: string
+  payout: number
+  salespersonIds: number[]
+  salespersonName: string
+  payments: PayLine[]
+  lines: { category: string; purity: string; weightG: number; recyclePrice?: number; credit?: number }[]
+  madeAt: string
+}
+const hdocs = ref<HDoc[]>([])
+const hsEditingId = ref(0)
+const hsEditingNo = ref('')
+const hsLines = ref<SlOld[]>([])
+const hsSalespersonIds = ref<number[]>([])
+const hsPays = ref<PayLine[]>([])
+
+function hsReset() {
+  hsEditingId.value = 0
+  hsEditingNo.value = ''
+  hsLines.value = []
+  hsSalespersonIds.value = []
+  hsPays.value = []
+}
+function hsAddLine() {
+  hsLines.value.push({
+    category: enabledCats()[0]?.name ?? '',
+    purity: enabledPurities()[0]?.name ?? '',
+    weightG: null,
+  })
+}
+function hsRemoveLine(i: number) {
+  hsLines.value.splice(i, 1)
+}
+const hsTotal = () => hsLines.value.reduce(
+  (s2, o) => s2 + (Number(o.weightG) || 0) * recycleRateOf(o.purity), 0)
+const hsPayTotal = () => hsPays.value.reduce((s2, p) => s2 + (Number(p.amount) || 0), 0)
+function hsToggleSp(id: number) {
+  const i = hsSalespersonIds.value.indexOf(id)
+  if (i >= 0) hsSalespersonIds.value.splice(i, 1)
+  else if (hsSalespersonIds.value.length < 3) hsSalespersonIds.value.push(id)
+  else errMsg.value = '售货员最多3人'
+}
+function hsAddPay() {
+  const used = new Set(hsPays.value.map(p => p.method))
+  const next = enabledPayMethods().find(m => !used.has(m.name))
+  hsPays.value.push({ method: next?.name ?? '', amount: null })
+}
+function hsRemovePay(i: number) {
+  hsPays.value.splice(i, 1)
+}
+function hsFillPay(p: PayLine) {
+  const others = hsPays.value.filter(x => x !== p).reduce((s2, x) => s2 + (Number(x.amount) || 0), 0)
+  p.amount = Math.round((hsTotal() - others) * 100) / 100
+}
+async function hsSave(confirmAfter: boolean) {
+  errMsg.value = ''
+  try {
+    const r = await api.recycleSave({
+      id: hsEditingId.value,
+      salespersonIds: hsSalespersonIds.value,
+      payments: hsPays.value.filter(p => p.method)
+        .map(p => ({ method: p.method, amount: Number(p.amount) || 0 })),
+      lines: hsLines.value.filter(o => (Number(o.weightG) || 0) > 0)
+        .map(o => ({ category: o.category, purity: o.purity, weightG: Number(o.weightG) })),
+    })
+    const id = hsEditingId.value || r.id
+    if (!hsEditingId.value) {
+      hsEditingId.value = r.id
+      hsEditingNo.value = r.docNo
+    }
+    if (confirmAfter) {
+      const c = await api.recycleConfirm(id)
+      flash(`回收已确认：${hsEditingNo.value}，付顾客 ¥${c.payout}`)
+      hsReset()
+    } else {
+      flash(`回收草稿已保存：${hsEditingNo.value}`)
+    }
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function hsConfirmDoc(d: HDoc) {
+  errMsg.value = ''
+  try {
+    const c = await api.recycleConfirm(d.id)
+    flash(`回收已确认：${d.docNo}，付顾客 ¥${c.payout}`)
+    if (hsEditingId.value === d.id) hsReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+    await refreshAll()
+  }
+}
+async function hsUnconfirmDoc(d: HDoc) {
+  errMsg.value = ''
+  try {
+    await api.recycleUnconfirm(d.id)
+    flash(`回收已反确认：${d.docNo}`)
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+async function hsDeleteDoc(d: HDoc) {
+  errMsg.value = ''
+  try {
+    await api.recycleDelete(d.id)
+    flash(`回收草稿 ${d.docNo} 已删除`)
+    if (hsEditingId.value === d.id) hsReset()
+    await refreshAll()
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+function hsEdit(d: HDoc) {
+  hsEditingId.value = d.id
+  hsEditingNo.value = d.docNo
+  hsLines.value = d.lines.map(o => ({ category: o.category, purity: o.purity, weightG: o.weightG }))
+  hsSalespersonIds.value = [...(d.salespersonIds ?? [])]
+  hsPays.value = (d.payments ?? []).map(p => ({ ...p }))
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
 // ===== 盘点单（v0.23） =====
 interface STRow {
   barcode: string
@@ -1281,13 +1409,14 @@ async function refreshAll() {
   if (fCategory.value) params.category = fCategory.value
   if (fKeyword.value.trim()) params.q = fKeyword.value.trim()
   if (fLoc.value !== '') params.loc = fLoc.value
-  const [ri, rd, ro, rs, rr, rt, rdist, rpd] = await Promise.all([
+  const [ri, rd, ro, rs, rr, rt, rdist, rpd, rhs] = await Promise.all([
     api.items(params), api.inboundList(), api.outboundList(), api.saleList(), api.saleReturnList(),
-    api.transferList(), api.distributorList(), api.stocktakeList(),
+    api.transferList(), api.distributorList(), api.stocktakeList(), api.recycleList(),
   ])
   tdocs.value = rt.list
   distributors.value = rdist.list
   pdocs.value = rpd.list
+  hdocs.value = rhs.list
   items.value = ri.list
   itemsTotal.value = ri.total
   itemsSumW.value = ri.sumWeightG
@@ -1957,6 +2086,102 @@ function editDoc(d: Doc) {
                 <td>{{ l.name }}</td>
                 <td style="width:110px">{{ l.purity }}</td>
                 <td style="width:90px">{{ (l.weightG ?? 0).toFixed(2) }}g</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 纯旧料回收单（v0.25） -->
+      <section class="card">
+        <h2>
+          {{ hsEditingId ? `编辑回收草稿 ${hsEditingNo}` : '旧料回收（顾客卖料给店里）' }}
+          <button v-if="hsEditingId" class="mini" @click="hsReset">放弃，新建</button>
+        </h2>
+        <div class="row" v-for="(o, i) in hsLines" :key="i">
+          <label>大类
+            <select v-model="o.category">
+              <option v-for="c in enabledCats()" :key="c.id" :value="c.name">{{ c.name }}</option>
+            </select>
+          </label>
+          <label>成色
+            <select v-model="o.purity">
+              <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
+            </select>
+          </label>
+          <label>克重 <input v-model.number="o.weightG" type="number" step="0.01" style="width:90px" /></label>
+          <span class="hint" v-if="(Number(o.weightG) || 0) > 0">
+            × 回收价 {{ recycleRateOf(o.purity).toFixed(2) }} = ¥{{ ((Number(o.weightG) || 0) * recycleRateOf(o.purity)).toFixed(2) }}
+          </span>
+          <button class="mini danger" @click="hsRemoveLine(i)">移除</button>
+        </div>
+        <div class="row">
+          <button class="mini" @click="hsAddLine">+ 添加旧料</button>
+        </div>
+        <template v-if="hsLines.length">
+          <div class="row">
+            <span>经手售货员(可多选)：</span>
+            <button v-for="s in saleSalespersons()" :key="s.id" class="mini"
+              :style="hsSalespersonIds.includes(s.id) ? 'background:#2f7d4f' : ''"
+              @click="hsToggleSp(s.id)">
+              {{ s.name }}{{ s.role === '店长' ? '(店长)' : '' }}
+            </button>
+          </div>
+          <div class="row" v-for="(p, i) in hsPays" :key="i">
+            <label>付款方式
+              <select v-model="p.method">
+                <option v-for="m in enabledPayMethods()" :key="m.id" :value="m.name">{{ m.name }}</option>
+              </select>
+            </label>
+            <label>金额 <input v-model.number="p.amount" type="number" step="0.01" style="width:110px" /></label>
+            <button class="mini" @click="hsFillPay(p)">补足</button>
+            <button class="mini danger" @click="hsRemovePay(i)">移除</button>
+          </div>
+          <div class="row">
+            <button class="mini" @click="hsAddPay">+ 添加付款方式</button>
+            <span class="hint" v-if="hsPays.length">
+              已付 ¥{{ hsPayTotal().toFixed(2) }} / 应付顾客 ¥{{ hsTotal().toFixed(2) }}
+              <b v-if="Math.abs(hsPayTotal() - hsTotal()) > 0.005" style="color:#c0392b">（差 ¥{{ (hsTotal() - hsPayTotal()).toFixed(2) }}）</b>
+              <b v-else style="color:#2f7d4f">✓ 两讫</b>
+            </span>
+          </div>
+          <div class="row">
+            <p class="ok" style="margin:0">应付顾客：¥{{ hsTotal().toFixed(2) }}</p>
+            <span class="spacer"></span>
+            <button class="gray" @click="hsSave(false)">保存草稿</button>
+            <button @click="hsSave(true)">确认付款</button>
+          </div>
+        </template>
+        <p class="hint">全部按当日回收价折算（确认时快照）；回收提成按"旧料回收"规则入账；反确认限当日。旧料暂不入库存（旧料库待做）。</p>
+      </section>
+
+      <!-- 回收单列表 -->
+      <section class="card" v-if="hdocs.length">
+        <h2>回收单列表（{{ hdocs.length }} 张）</h2>
+        <div v-for="d in hdocs" :key="d.id" class="doc">
+          <div class="dochead">
+            <span class="mono">{{ d.docNo }}</span>
+            <span :class="['badge', d.status === '草稿' ? 'draft' : 'ok2']">{{ d.status }}</span>
+            <span class="ok" v-if="d.payout > 0">付 ¥{{ d.payout.toFixed(2) }}</span>
+            <span v-if="d.salespersonName">经手：{{ d.salespersonName }}</span>
+            <span class="hint">{{ (d.lines?.length ?? 0) }} 行 · {{ d.madeAt }}</span>
+            <span class="spacer"></span>
+            <template v-if="d.status === '草稿'">
+              <button class="mini" @click="hsEdit(d)">取单</button>
+              <button class="mini" @click="hsConfirmDoc(d)">确认付款</button>
+              <button class="mini danger" @click="hsDeleteDoc(d)">删除</button>
+            </template>
+            <template v-else>
+              <button class="mini danger" @click="hsUnconfirmDoc(d)">反确认(限当日)</button>
+            </template>
+          </div>
+          <table v-if="d.lines?.length">
+            <tbody>
+              <tr v-for="(o, j) in d.lines" :key="j">
+                <td style="width:120px">{{ o.category }}</td>
+                <td style="width:140px">{{ o.purity }}</td>
+                <td style="width:100px">{{ (o.weightG ?? 0).toFixed(2) }}g</td>
+                <td>{{ o.recyclePrice ? `×${o.recyclePrice.toFixed(2)} = ¥${(o.credit ?? 0).toFixed(2)}` : '—' }}</td>
               </tr>
             </tbody>
           </table>
