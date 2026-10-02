@@ -55,6 +55,24 @@ async function request(method: string, path: string, body?: unknown) {
   return data
 }
 
+// 下载文件（带令牌），浏览器/Electron 都会弹保存
+export async function downloadFile(path: string, filename: string) {
+  const res = await fetch(API_BASE + path, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error((data as { error?: string }).error || `下载失败(${res.status})`)
+  }
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export const api = {
   login: (username: string, password: string) =>
     request('POST', '/api/login', { username, password }),

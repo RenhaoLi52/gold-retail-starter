@@ -2,7 +2,7 @@
 // 入库单界面 v0.3：支持单据生命周期——保存草稿 → 确认 → 反确认 / 删除草稿
 // 草稿可反复编辑；确认后生成货品件进入库存；反确认撤回（条码保留）。
 import { onMounted, ref } from 'vue'
-import { api, setToken, hasToken, clearToken } from './api'
+import { api, setToken, hasToken, clearToken, downloadFile } from './api'
 
 // ===== 登录 =====
 const logged = ref(false)
@@ -1429,6 +1429,17 @@ async function refreshAll() {
   await loadSalespersons()
 }
 
+// v0.26：导出该入库单的 Label Matrix 标签数据文件
+async function exportLabels(d: Doc) {
+  errMsg.value = ''
+  try {
+    await downloadFile(`/api/doc/inbound/labels?id=${d.id}`, `标签数据-${d.docNo}.xlsx`)
+    flash(`标签数据已导出：${d.docNo}——在 Label Matrix 里把数据源指向该文件即可打印`)
+  } catch (e) {
+    errMsg.value = (e as Error).message
+  }
+}
+
 function addLine() {
   lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null })
 }
@@ -2334,6 +2345,7 @@ function editDoc(d: Doc) {
               <button class="mini danger" @click="deleteDoc(d)">删除</button>
             </template>
             <template v-else>
+              <button class="mini" @click="exportLabels(d)">导出标签</button>
               <button class="mini danger" @click="unconfirmDoc(d)">反确认</button>
             </template>
           </div>

@@ -17,6 +17,7 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
@@ -26,6 +27,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -4681,6 +4683,156 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"list": list, "total": total, "sumWeightG": sumW})
 }
 
+// ===== 标签数据导出（v0.26）—— 方案1：借 Label Matrix 的力 =====
+// 复刻 JMP 写给 Label Matrix 的「标签数据」表格式（111列，照原文件逐列抄录），
+// LM 模板按列名取数，我们填得上的填、填不上的留空。导出 .xlsx，
+// 用户在 LM 里把数据源指向这个文件（一次性操作），之后照老习惯选打印机打标签。
+
+var labelHeaders = []string{
+	"条码号", "金料成色", "首饰类别", "首饰大类", "首饰小类", "净金重", "含配金重", "手寸", "销售工费方式", "销售工费", "售价", "主石名称",
+	"成色含量", "金料成色大名称", "主石大名称", "首饰类别大名称", "首饰品牌", "首饰系列", "款式系列", "外部款号", "首饰工艺1", "首饰工艺2", "首饰工艺3",
+	"证书号", "证书号2", "原编号", "内部款号", "线上编号", "二维码", "监管码", "供应商", "供应商代号", "自定列1", "自定列2", "自定列3",
+	"下拉自定列1", "下拉自定列2", "下拉自定列3", "数值自定列1", "数值自定列2", "总件重", "配件1名称", "配件1数量", "配件1重量", "配件2名称",
+	"配件2数量", "配件2重量", "主石石号", "主石规格", "主石粒数", "主石重量", "主石单位", "主石形状", "主石颜色", "主石净度", "主石切工", "主石对称性",
+	"主石抛光度", "主石荧光", "主石全深比", "主石台宽比", "主石镶法", "主石爪型", "副石1号", "副石1名", "副石1规格", "副石1粒数", "副石1重量",
+	"副石1单位", "副石1形状", "副石1颜色", "副石1净度", "副石1切工", "副石2号", "副石2名", "副石2规格", "副石2粒数", "副石2重量", "副石2单位",
+	"副石2形状", "副石2颜色", "副石2净度", "副石2切工", "副石3号", "副石3名", "副石3粒数", "副石3重量", "副石4号", "副石4名", "副石4粒数",
+	"副石4重量", "副石5号", "副石5名", "副石5粒数", "副石5重量", "副石总粒数", "副石总重量", "其他费", "促销原价", "售价2", "首饰备注", "入库顺序",
+	"退库顺序", "进货顺序", "调柜顺序", "调退顺序", "修改顺序", "销售顺序", "销退顺序", "盘点顺序", "首饰图片",
+}
+
+func xmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// writeXLSX 用标准库手写一个最小可用的 .xlsx（zip 里几个 XML，单元格全部内联字符串）。
+// 不引第三方库——我们只需要"Excel 和 Label Matrix 能读"这一件事。
+func writeXLSX(w io.Writer, sheetName string, rows [][]string) error {
+	zw := zip.NewWriter(w)
+	add := func(name, content string) error {
+		f, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write([]byte(content))
+		return err
+	}
+	if err := add("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`); err != nil {
+		return err
+	}
+	if err := add("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`); err != nil {
+		return err
+	}
+	if err := add("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="`+xmlEscape(sheetName)+`" sheetId="1" r:id="rId1"/></sheets>
+</workbook>`); err != nil {
+		return err
+	}
+	if err := add("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	sb.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>`)
+	for _, row := range rows {
+		sb.WriteString("<row>")
+		for _, cell := range row {
+			if cell == "" {
+				sb.WriteString(`<c t="inlineStr"><is><t/></is></c>`)
+			} else {
+				sb.WriteString(`<c t="inlineStr"><is><t>` + xmlEscape(cell) + `</t></is></c>`)
+			}
+		}
+		sb.WriteString("</row>")
+	}
+	sb.WriteString(`</sheetData></worksheet>`)
+	if err := add("xl/worksheets/sheet1.xml", sb.String()); err != nil {
+		return err
+	}
+	return zw.Close()
+}
+
+// GET /api/doc/inbound/labels?id=N —— 导出该入库单货品的标签数据（仅已确认单）
+func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
+	if !requireHQ(w, r) {
+		return
+	}
+	id, _ := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if id == 0 {
+		writeErr(w, 400, "参数错误：缺少单据id")
+		return
+	}
+	var docNo, status string
+	err := db.QueryRow(`SELECT doc_no, status FROM doc WHERE id=$1 AND doc_type='inbound'`, id).
+		Scan(&docNo, &status)
+	if err == sql.ErrNoRows {
+		writeErr(w, 400, "入库单不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "查询失败: "+err.Error())
+		return
+	}
+	if status != "已确认" {
+		writeErr(w, 400, "只有已确认的入库单才能导出标签（草稿还没发条码号）")
+		return
+	}
+	rows, err := db.Query(`SELECT it.barcode, it.name, it.category, it.purity, it.weight_g, it.price
+		FROM doc_line dl JOIN item it ON it.id = dl.item_id
+		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, id)
+	if err != nil {
+		writeErr(w, 500, "明细查询失败: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	col := map[string]int{}
+	for i, h := range labelHeaders {
+		col[h] = i
+	}
+	data := [][]string{labelHeaders}
+	for rows.Next() {
+		var barcode, name, category, purity string
+		var weight, price float64
+		if err := rows.Scan(&barcode, &name, &category, &purity, &weight, &price); err != nil {
+			writeErr(w, 500, "读取失败: "+err.Error())
+			return
+		}
+		row := make([]string, len(labelHeaders))
+		row[col["条码号"]] = barcode
+		row[col["金料成色"]] = purity
+		row[col["首饰类别"]] = name
+		row[col["首饰大类"]] = category
+		row[col["净金重"]] = fmt.Sprintf("%.4f", weight)
+		row[col["含配金重"]] = fmt.Sprintf("%.4f", weight)
+		row[col["总件重"]] = fmt.Sprintf("%.4f", weight)
+		row[col["售价"]] = fmt.Sprintf("%g", price)
+		data = append(data, row)
+	}
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", `attachment; filename="labels.xlsx"`)
+	if err := writeXLSX(w, "数据", data); err != nil {
+		// 响应头已发出，只能记录——实践中 zip 写内存缓冲更稳，此处简化
+		return
+	}
+	_ = docNo
+}
+
 // ===== 入库单：保存草稿 =====
 // POST /api/doc/inbound/save  请求: {id?, category, lines[]}
 // id 为空 → 新建草稿并取单号（草稿即占号，删除不回收）；id 非空 → 更新已有草稿。
@@ -5118,6 +5270,7 @@ func main() {
 	mux.HandleFunc("POST /api/doc/inbound/unconfirm", withAuth(handleInboundUnconfirm))
 	mux.HandleFunc("POST /api/doc/inbound/delete", withAuth(handleInboundDelete))
 	mux.HandleFunc("GET /api/doc/inbound", withAuth(handleInboundList))
+	mux.HandleFunc("GET /api/doc/inbound/labels", withAuth(handleInboundLabels))
 	mux.HandleFunc("POST /api/doc/outbound/save", withAuth(handleOutboundSave))
 	mux.HandleFunc("POST /api/doc/outbound/confirm", withAuth(handleOutboundConfirm))
 	mux.HandleFunc("POST /api/doc/outbound/unconfirm", withAuth(handleOutboundUnconfirm))
