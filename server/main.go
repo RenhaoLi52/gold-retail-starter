@@ -48,9 +48,11 @@ type Item struct {
 	Category string  `json:"category,omitempty"`
 	Purity   string  `json:"purity"`
 	WeightG  float64 `json:"weightG"`
-	Price    float64 `json:"price"`
-	Status   string  `json:"status"`
-	Location string  `json:"location,omitempty"` // v0.18：总库 或 分销商名
+	Price     float64 `json:"price"`
+	Status    string  `json:"status"`
+	Location  string  `json:"location,omitempty"` // v0.18：总库 或 分销商名
+	JewelType string  `json:"jewelType,omitempty"` // v0.28 名称三要素
+	StoneName string  `json:"stoneName,omitempty"`
 	// v0.27 计价模型
 	SaleFeeMode   string  `json:"saleFeeMode,omitempty"`
 	SaleFee       float64 `json:"saleFee,omitempty"`
@@ -62,16 +64,34 @@ type Item struct {
 // DraftLine 草稿明细行（存进 doc.draft_lines 的 JSON 结构，字段名与前端一致）
 type DraftLine struct {
 	Barcode string  `json:"barcode"`
-	Name    string  `json:"name"`
+	Name    string  `json:"name"` // v0.28起由服务端拼接：成色+主石名称+首饰类别
 	Purity  string  `json:"purity"`
-	WeightG float64 `json:"weightG"`
-	Price   float64 `json:"price"` // 售价(标签价)，0=未定价
+	// v0.28：名称三要素中的另外两段（既可选字典也可直接填，新值自动进字典）
+	StoneName string  `json:"stoneName"`
+	JewelType string  `json:"jewelType"`
+	WeightG   float64 `json:"weightG"`
+	Price     float64 `json:"price"` // 售价(标签价)，0=未定价
 	// v0.27 计价模型：销售工费（变金价=克重×金价+工费）与进货成本
 	SaleFeeMode   string  `json:"saleFeeMode,omitempty"` // 按克/按件
 	SaleFee       float64 `json:"saleFee,omitempty"`
 	CostGoldPrice float64 `json:"costGoldPrice,omitempty"` // 进货金价(元/克)
 	CostFeeMode   string  `json:"costFeeMode,omitempty"`
 	CostFee       float64 `json:"costFee,omitempty"`
+}
+
+// ensureDictValues 把入库时直接填写的新值补进字典（已存在则跳过）——
+// "可以直接填写，也可以下拉"的另一半：填过一次，下次就在下拉里。
+func ensureDictValues(tx *sql.Tx, dictType string, values map[string]bool) error {
+	for v := range values {
+		if v == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO dict_item (dict_type, name, sort)
+			VALUES ($1,$2,99) ON CONFLICT (dict_type, name) DO NOTHING`, dictType, v); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // feeAmount 工费金额：按克=克重×单价；按件=固定额
@@ -267,8 +287,20 @@ func normalizeLines(lines []DraftLine) ([]DraftLine, error) {
 			}
 			seen[l.Barcode] = true
 		}
-		if strings.TrimSpace(l.Name) == "" {
-			return nil, fmt.Errorf("第%d行缺少首饰名称", i+1)
+		// v0.28：名称=成色+主石名称+首饰类别 拼接而成，不再手填。
+		// 类别必填（名称的骨架）；主石可空（素金）。老草稿（无类别但有名称）原样放行。
+		l.Purity = strings.TrimSpace(l.Purity)
+		l.StoneName = strings.TrimSpace(l.StoneName)
+		l.JewelType = strings.TrimSpace(l.JewelType)
+		if l.Purity == "" {
+			return nil, fmt.Errorf("第%d行缺少成色", i+1)
+		}
+		if l.JewelType == "" {
+			if strings.TrimSpace(l.Name) == "" {
+				return nil, fmt.Errorf("第%d行缺少首饰类别", i+1)
+			}
+		} else {
+			l.Name = l.Purity + l.StoneName + l.JewelType
 		}
 		if l.WeightG <= 0 {
 			return nil, fmt.Errorf("第%d行总件重必须大于0", i+1)
@@ -632,7 +664,7 @@ func handleUserResetPwd(w http.ResponseWriter, r *http.Request) {
 // 三个字典（大类/成色/类别）共用一张表、一套接口——与单据引擎同源的复用思想。
 // 读取：所有登录用户；新增/修改：仅管理员。只停用不删除。
 
-var validDictTypes = map[string]bool{"category": true, "purity": true, "jewel_type": true, "pay_method": true}
+var validDictTypes = map[string]bool{"category": true, "purity": true, "jewel_type": true, "pay_method": true, "stone_name": true}
 
 // GET /api/dict?type=category —— 读取某字典（含停用项，前端下拉自行过滤 enabled）
 func handleDictList(w http.ResponseWriter, r *http.Request) {
@@ -4846,7 +4878,7 @@ func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := db.Query(`SELECT it.barcode, it.name, it.category, it.purity, it.weight_g, it.price,
-		it.labor_fee_mode, it.labor_fee
+		it.labor_fee_mode, it.labor_fee, it.jewel_type, it.stone_name
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, id)
 	if err != nil {
@@ -4860,16 +4892,20 @@ func handleInboundLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := [][]string{labelHeaders}
 	for rows.Next() {
-		var barcode, name, category, purity, feeMode string
+		var barcode, name, category, purity, feeMode, jewelType, stoneName string
 		var weight, price, fee float64
-		if err := rows.Scan(&barcode, &name, &category, &purity, &weight, &price, &feeMode, &fee); err != nil {
+		if err := rows.Scan(&barcode, &name, &category, &purity, &weight, &price, &feeMode, &fee, &jewelType, &stoneName); err != nil {
 			writeErr(w, 500, "读取失败: "+err.Error())
 			return
+		}
+		if jewelType == "" { // 老货没有类别字段，退回用名称
+			jewelType = name
 		}
 		row := make([]string, len(labelHeaders))
 		row[col["条码号"]] = barcode
 		row[col["金料成色"]] = purity
-		row[col["首饰类别"]] = name
+		row[col["首饰类别"]] = jewelType
+		row[col["主石名称"]] = stoneName
 		row[col["首饰大类"]] = category
 		row[col["净金重"]] = fmt.Sprintf("%.4f", weight)
 		row[col["含配金重"]] = fmt.Sprintf("%.4f", weight)
@@ -5027,6 +5063,26 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v0.28：直填的新值自动补进字典（下次就在下拉里）
+	pset, jset, sset := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, l := range lines {
+		pset[l.Purity] = true
+		jset[l.JewelType] = true
+		sset[l.StoneName] = true
+	}
+	if err := ensureDictValues(tx, "purity", pset); err != nil {
+		writeErr(w, 500, "字典更新失败: "+err.Error())
+		return
+	}
+	if err := ensureDictValues(tx, "jewel_type", jset); err != nil {
+		writeErr(w, 500, "字典更新失败: "+err.Error())
+		return
+	}
+	if err := ensureDictValues(tx, "stone_name", sset); err != nil {
+		writeErr(w, 500, "字典更新失败: "+err.Error())
+		return
+	}
+
 	// 逐行生成货品件（条码留空→发号；已有条码→查重后复用）
 	today := time.Now().Format("20060102")
 	doc := InboundDoc{ID: req.ID, DocNo: docNo, Category: category, Status: "已确认",
@@ -5054,10 +5110,11 @@ func handleInboundConfirm(w http.ResponseWriter, r *http.Request) {
 		var itemID int64
 		err = tx.QueryRow(`
 			INSERT INTO item (barcode, name, category, purity, weight_g, price, status,
-				labor_fee_mode, labor_fee, cost_gold_price, cost_fee_mode, cost_fee)
-			VALUES ($1,$2,$3,$4,$5,$6,'在库',$7,$8,$9,$10,$11) RETURNING id`,
+				labor_fee_mode, labor_fee, cost_gold_price, cost_fee_mode, cost_fee, jewel_type, stone_name)
+			VALUES ($1,$2,$3,$4,$5,$6,'在库',$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 			bc, l.Name, category, l.Purity, l.WeightG, l.Price,
-			l.SaleFeeMode, l.SaleFee, l.CostGoldPrice, l.CostFeeMode, l.CostFee).Scan(&itemID)
+			l.SaleFeeMode, l.SaleFee, l.CostGoldPrice, l.CostFeeMode, l.CostFee,
+			l.JewelType, l.StoneName).Scan(&itemID)
 		if err != nil {
 			writeErr(w, 500, fmt.Sprintf("第%d行写入失败: %s", i+1, err.Error()))
 			return
@@ -5130,7 +5187,8 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	// （将来有了销售/分销单，被引用的件状态会变，这里就会拦住并指明哪件被占用。）
 	rows, err := tx.Query(`
 		SELECT it.id, it.barcode, it.status, it.name, it.purity, it.weight_g, it.price,
-			it.labor_fee_mode, it.labor_fee, it.cost_gold_price, it.cost_fee_mode, it.cost_fee
+			it.labor_fee_mode, it.labor_fee, it.cost_gold_price, it.cost_fee_mode, it.cost_fee,
+			it.jewel_type, it.stone_name
 		FROM doc_line dl JOIN item it ON it.id = dl.item_id
 		WHERE dl.doc_id=$1 ORDER BY dl.line_no`, req.ID)
 	if err != nil {
@@ -5145,9 +5203,9 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 	var rebuilt []DraftLine // 从真实货品件重建草稿明细（兼容老单据草稿字段为空的情况）
 	for rows.Next() {
 		var id int64
-		var bc, st, name, purity, sfm, cfm string
+		var bc, st, name, purity, sfm, cfm, jt, sn string
 		var wg, pr, sf, cgp, cf float64
-		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg, &pr, &sfm, &sf, &cgp, &cfm, &cf); err != nil {
+		if err := rows.Scan(&id, &bc, &st, &name, &purity, &wg, &pr, &sfm, &sf, &cgp, &cfm, &cf, &jt, &sn); err != nil {
 			rows.Close()
 			writeErr(w, 500, "明细读取失败: "+err.Error())
 			return
@@ -5159,7 +5217,8 @@ func handleInboundUnconfirm(w http.ResponseWriter, r *http.Request) {
 		}
 		itemRefs = append(itemRefs, ref{id, bc})
 		rebuilt = append(rebuilt, DraftLine{Barcode: bc, Name: name, Purity: purity, WeightG: wg, Price: pr,
-			SaleFeeMode: sfm, SaleFee: sf, CostGoldPrice: cgp, CostFeeMode: cfm, CostFee: cf})
+			SaleFeeMode: sfm, SaleFee: sf, CostGoldPrice: cgp, CostFeeMode: cfm, CostFee: cf,
+			JewelType: jt, StoneName: sn})
 	}
 	rows.Close()
 	if len(rebuilt) > 0 {
@@ -5259,7 +5318,8 @@ func handleInboundList(w http.ResponseWriter, r *http.Request) {
 				docs[i].Items = append(docs[i].Items, Item{Barcode: l.Barcode, Name: l.Name,
 					Purity: l.Purity, WeightG: l.WeightG, Price: l.Price, Status: "草稿",
 					SaleFeeMode: l.SaleFeeMode, SaleFee: l.SaleFee,
-					CostGoldPrice: l.CostGoldPrice, CostFeeMode: l.CostFeeMode, CostFee: l.CostFee})
+					CostGoldPrice: l.CostGoldPrice, CostFeeMode: l.CostFeeMode, CostFee: l.CostFee,
+					JewelType: l.JewelType, StoneName: l.StoneName})
 			}
 			continue
 		}

@@ -32,6 +32,8 @@ interface Item {
   costGoldPrice?: number
   costFeeMode?: string
   costFee?: number
+  jewelType?: string
+  stoneName?: string
 }
 const items = ref<Item[]>([])
 const itemsTotal = ref(0)
@@ -56,8 +58,9 @@ const docs = ref<Doc[]>([])
 // ===== 编辑中的单据（表单状态） =====
 interface Line {
   barcode: string
-  name: string
   purity: string
+  stoneName: string
+  jewelType: string
   weightG: number | null
   price: number | null
   saleFeeMode: string
@@ -1083,18 +1086,19 @@ interface DictItem {
   sort: number
   enabled: boolean
 }
-const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [], pay_method: [] })
-const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别', pay_method: '收款方式' }
+const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [], pay_method: [], stone_name: [] })
+const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别', stone_name: '主石名称', pay_method: '收款方式' }
 const dictTab = ref('category')
 const showDicts = ref(false)
 const ndName = ref('')
 const ndSort = ref(0)
 
 async function loadDicts() {
-  const [c, pu, j, pm] = await Promise.all([
+  const [c, pu, j, pm, sn] = await Promise.all([
     api.dictList('category'), api.dictList('purity'), api.dictList('jewel_type'), api.dictList('pay_method'),
+    api.dictList('stone_name'),
   ])
-  dicts.value = { category: c.list, purity: pu.list, jewel_type: j.list, pay_method: pm.list }
+  dicts.value = { category: c.list, purity: pu.list, jewel_type: j.list, pay_method: pm.list, stone_name: sn.list }
 }
 // 开单下拉只用启用项
 const enabledCats = () => dicts.value.category.filter(d => d.enabled)
@@ -1356,8 +1360,10 @@ async function changePwd() {
 const editingId = ref(0) // 0=新单；>0=正在编辑的草稿id
 const editingNo = ref('')
 const category = ref('黄金')
-const lines = ref<Line[]>([{ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null,
+const lines = ref<Line[]>([{ barcode: '', purity: '足金999.9', stoneName: '', jewelType: '', weightG: null, price: null,
   saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null }])
+// v0.28：名称=成色+主石+类别 实时预览（真正的拼接在服务端做）
+const composedName = (l: Line) => `${l.purity}${l.stoneName}${l.jewelType}`
 
 function resetForm() {
   editingId.value = 0
@@ -1456,7 +1462,7 @@ async function exportLabels(d: Doc) {
 }
 
 function addLine() {
-  lines.value.push({ barcode: '', name: '', purity: '足金999.9', weightG: null, price: null,
+  lines.value.push({ barcode: '', purity: '足金999.9', stoneName: '', jewelType: '', weightG: null, price: null,
     saleFeeMode: '按克', saleFee: null, costGoldPrice: null, costFeeMode: '按克', costFee: null })
 }
 function removeLine(i: number) {
@@ -1469,8 +1475,9 @@ function payload() {
     category: category.value,
     lines: lines.value.map((l) => ({
       barcode: l.barcode,
-      name: l.name,
       purity: l.purity,
+      stoneName: l.stoneName.trim(),
+      jewelType: l.jewelType.trim(),
       weightG: Number(l.weightG) || 0,
       price: Number(l.price) || 0,
       saleFeeMode: l.saleFeeMode,
@@ -1559,8 +1566,10 @@ function editDoc(d: Doc) {
   category.value = d.category
   lines.value = d.items.map((it) => ({
     barcode: it.barcode,
-    name: it.name,
     purity: it.purity,
+    stoneName: it.stoneName ?? '',
+    jewelType: it.jewelType ?? (it.stoneName === undefined ? it.name : ''), // 老草稿退回整名
+
     weightG: it.weightG,
     price: it.price ?? 0,
     saleFeeMode: it.saleFeeMode || '按克',
@@ -2329,18 +2338,16 @@ function editDoc(d: Doc) {
         </div>
         <table>
           <thead>
-            <tr><th>#</th><th>条码号(留空自动生成)</th><th>首饰名称</th><th>成色</th><th>总件重(g)</th><th>售价(¥)</th><th>销售工费</th><th>进货金价</th><th>进货工费</th><th></th></tr>
+            <tr><th>#</th><th>条码号(留空自动生成)</th><th>成色</th><th>主石名称</th><th>首饰类别</th><th>名称(自动)</th><th>总件重(g)</th><th>售价(¥)</th><th>销售工费</th><th>进货金价</th><th>进货工费</th><th></th></tr>
           </thead>
           <tbody>
             <tr v-for="(l, i) in lines" :key="i">
               <td>{{ i + 1 }}</td>
-              <td><input v-model="l.barcode" placeholder="自动生成" /></td>
-              <td><input v-model="l.name" /></td>
-              <td>
-                <select v-model="l.purity">
-                  <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name">{{ pu.name }}</option>
-                </select>
-              </td>
+              <td><input v-model="l.barcode" placeholder="自动生成" style="width:110px" /></td>
+              <td><input v-model="l.purity" list="dlPurity" style="width:92px" /></td>
+              <td><input v-model="l.stoneName" list="dlStone" placeholder="素金留空" style="width:84px" /></td>
+              <td><input v-model="l.jewelType" list="dlJewel" style="width:76px" /></td>
+              <td class="hint">{{ composedName(l) || '—' }}</td>
               <td><input v-model.number="l.weightG" type="number" step="0.01" style="width:80px" /></td>
               <td><input v-model.number="l.price" type="number" step="1" placeholder="0" style="width:80px" /></td>
               <td>
@@ -2356,12 +2363,21 @@ function editDoc(d: Doc) {
             </tr>
           </tbody>
         </table>
+        <datalist id="dlPurity">
+          <option v-for="pu in enabledPurities()" :key="pu.id" :value="pu.name" />
+        </datalist>
+        <datalist id="dlStone">
+          <option v-for="s in dicts.stone_name.filter(x => x.enabled)" :key="s.id" :value="s.name" />
+        </datalist>
+        <datalist id="dlJewel">
+          <option v-for="jt in dicts.jewel_type.filter(x => x.enabled)" :key="jt.id" :value="jt.name" />
+        </datalist>
         <div class="row">
           <button class="mini" @click="addLine">+ 增加行</button>
           <button class="gray" @click="saveDraft">保存草稿</button>
           <button @click="saveAndConfirm">保存并确认</button>
         </div>
-        <p class="hint">草稿不动库存；点"确认"的那一刻才生成货品件。按克货：售价可填0，销售时按 克重×金价+销售工费；进货金价/工费是成本（仅管理员可见），供将来毛利核算。</p>
+        <p class="hint">名称=成色+主石名称+首饰类别 自动拼接；三个字段可下拉选也可直接填，确认时新值自动补进字典。按克货售价可填0，销售按 克重×金价+销售工费；进货金价/工费是成本（仅管理员可见）。</p>
       </section>
 
       <!-- 单据列表 -->
