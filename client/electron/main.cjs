@@ -6,8 +6,11 @@ const path = require('path')
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1280,
-    height: 860,
+    // v0.30：界面按 1600×900（16:9）设计稿等比缩放，窗口默认也开成 16:9；
+    // useContentSize 让宽高指"网页内容区"而非含标题栏的外框，内容区正好 16:9。
+    width: 1600,
+    height: 900,
+    useContentSize: true,
     title: '黄金零售系统',
     webPreferences: {
       contextIsolation: true, // 安全默认：渲染页面与Node隔离

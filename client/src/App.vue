@@ -1,8 +1,68 @@
 <script setup lang="ts">
 // 入库单界面 v0.3：支持单据生命周期——保存草稿 → 确认 → 反确认 / 删除草稿
 // 草稿可反复编辑；确认后生成货品件进入库存；反确认撤回（条码保留）。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api, setToken, hasToken, clearToken, downloadFile, uploadFile } from './api'
+import Icon from './components/Icon.vue'
+
+// ===== UI壳（v0.30）：16:9等比画布 + 侧边栏分页 =====
+const page = ref('sale')
+const stageScale = ref(1)
+function fitStage() {
+  stageScale.value = Math.min(window.innerWidth / 1600, window.innerHeight / 900)
+}
+onMounted(() => {
+  fitStage()
+  window.addEventListener('resize', fitStage)
+})
+
+interface NavItem { key: string; label: string; icon: string; hq?: boolean; admin?: boolean; todo?: boolean }
+const navDef: { title: string; items: NavItem[] }[] = [
+  { title: '销售', items: [
+    { key: 'sale', label: '销售开单', icon: 'sale' },
+    { key: 'saleReturn', label: '销退单', icon: 'return' },
+    { key: 'recycle', label: '旧料回收', icon: 'recycle' },
+  ]},
+  { title: '库存', items: [
+    { key: 'inventory', label: '库存查询', icon: 'search' },
+    { key: 'inbound', label: '入库', icon: 'inbound', hq: true },
+    { key: 'outbound', label: '退库', icon: 'outbound', hq: true },
+    { key: 'transfer', label: '调拨', icon: 'transfer', hq: true },
+    { key: 'stocktake', label: '盘点', icon: 'stocktake' },
+  ]},
+  { title: '资料', items: [
+    { key: 'goldprice', label: '今日金价', icon: 'coins' },
+    { key: 'dicts', label: '基础资料', icon: 'book', admin: true },
+    { key: 'salespersons', label: '售货员', icon: 'users', admin: true },
+    { key: 'distributors', label: '分销商', icon: 'store', admin: true },
+    { key: 'rules', label: '提成规则', icon: 'percent', admin: true },
+  ]},
+  { title: '系统', items: [
+    { key: 'report', label: '提成报表', icon: 'chart', admin: true },
+    { key: 'users', label: '用户管理', icon: 'user', admin: true },
+    { key: 'salesReport', label: '销售报表', icon: 'chart', admin: true, todo: true },
+    { key: 'oldmat', label: '旧料库', icon: 'archive', admin: true, todo: true },
+    { key: 'perms', label: '权限管理', icon: 'shield', admin: true, todo: true },
+    { key: 'settings', label: '系统参数', icon: 'settings', admin: true, todo: true },
+  ]},
+]
+const visibleNav = computed(() => navDef
+  .map(g => ({ ...g, items: g.items.filter(m => (!m.hq || isHQ.value) && (!m.admin || isAdmin.value)) }))
+  .filter(g => g.items.length))
+const placeholderPages: Record<string, { label: string; icon: string }> = {
+  salesReport: { label: '销售报表', icon: 'chart' },
+  oldmat: { label: '旧料库', icon: 'archive' },
+  perms: { label: '权限管理', icon: 'shield' },
+  settings: { label: '系统参数', icon: 'settings' },
+}
+function goPage(k: string) {
+  page.value = k
+  errMsg.value = ''
+  // 懒加载的管理页
+  if (k === 'users') loadUsers()
+  if (k === 'rules') loadRules()
+  if (k === 'report') loadReport()
+}
 
 // ===== 登录 =====
 const logged = ref(false)
@@ -369,7 +429,6 @@ interface Distributor {
   status: number
 }
 const distributors = ref<Distributor[]>([])
-const showDists = ref(false)
 const ndistName = ref('')
 const enabledDists = () => distributors.value.filter(d => d.status === 1)
 
@@ -549,17 +608,12 @@ interface CommRow {
   net: number
   docCount: number
 }
-const showReport = ref(false)
 const crRows = ref<CommRow[]>([])
 const crTotals = ref({ sale: 0, trade: 0, mgr: 0, ret: 0, net: 0 })
 const today = new Date().toISOString().slice(0, 10)
 const crFrom = ref(today.slice(0, 8) + '01') // 本月1号
 const crTo = ref(today)
 
-async function toggleReport() {
-  showReport.value = !showReport.value
-  if (showReport.value) await loadReport()
-}
 async function loadReport() {
   errMsg.value = ''
   try {
@@ -1089,7 +1143,6 @@ interface DictItem {
 const dicts = ref<Record<string, DictItem[]>>({ category: [], purity: [], jewel_type: [], pay_method: [], stone_name: [] })
 const dictLabels: Record<string, string> = { category: '首饰大类', purity: '成色', jewel_type: '首饰类别', stone_name: '主石名称', pay_method: '收款方式' }
 const dictTab = ref('category')
-const showDicts = ref(false)
 const ndName = ref('')
 const ndSort = ref(0)
 
@@ -1117,7 +1170,6 @@ interface Salesperson {
   managerRate: number
 }
 const salespersons = ref<Salesperson[]>([])
-const showSps = ref(false)
 const nspName = ref('')
 const nspSort = ref(0)
 const nspStore = ref(0)
@@ -1189,7 +1241,6 @@ interface CommRule {
   status: string
 }
 const commRules = ref<CommRule[]>([])
-const showRules = ref(false)
 const nrCategory = ref('')
 const nrBiz = ref('正常销售')
 const nrMode = ref('标签价')
@@ -1198,10 +1249,6 @@ const nrValue = ref<number | null>(null)
 const nrFrom = ref(new Date().toISOString().slice(0, 10))
 const calcUnit = (t: string) => t === '销售额百分比' ? '%' : t === '每克固定' ? '元/克' : '元/件'
 
-async function toggleRules() {
-  showRules.value = !showRules.value
-  if (showRules.value) await loadRules()
-}
 async function loadRules() {
   try {
     const r = await api.commissionRuleList()
@@ -1286,16 +1333,11 @@ interface User {
   created: string
 }
 const users = ref<User[]>([])
-const showUsers = ref(false)
 const nuUsername = ref('')
 const nuName = ref('')
 const nuPassword = ref('')
 const nuStore = ref(0) // 0=总部
 
-async function toggleUsers() {
-  showUsers.value = !showUsers.value
-  if (showUsers.value) await loadUsers()
-}
 async function loadUsers() {
   try {
     const r = await api.userList()
@@ -1610,33 +1652,58 @@ function editDoc(d: Doc) {
 </script>
 
 <template>
-  <main class="wrap">
-    <h1>黄金零售系统 · 入库管理</h1>
+  <!-- v0.30 UI壳：外层 viewport 铺满窗口，内层 stage 固定 1600×900 设计稿，
+       按窗口大小整体等比缩放（长宽同比例），不做逐元素自适应。 -->
+  <div class="viewport">
+    <div class="stage" :style="{ transform: `translate(-50%, -50%) scale(${stageScale})` }">
 
-    <!-- 登录页 -->
-    <section v-if="!logged" class="card">
-      <h2>登录</h2>
-      <div class="row">
-        <label>账号 <input v-model="username" /></label>
-        <label>密码 <input v-model="password" type="password" @keyup.enter="doLogin" /></label>
-        <button @click="doLogin">登录</button>
+      <!-- 登录屏 -->
+      <div v-if="!logged" class="login-screen">
+        <div class="login-card">
+          <div class="login-brand"><Icon name="gem" :size="30" /></div>
+          <h1 class="login-title">黄金零售管理系统</h1>
+          <label>账号 <input v-model="username" /></label>
+          <label>密码 <input v-model="password" type="password" @keyup.enter="doLogin" /></label>
+          <button class="login-btn" @click="doLogin">登 录</button>
+          <p v-if="errMsg" class="err">{{ errMsg }}</p>
+        </div>
       </div>
-      <p class="hint">教学账号：admin / 123456</p>
-      <p v-if="errMsg" class="err">{{ errMsg }}</p>
-    </section>
 
-    <template v-else>
-      <p class="hint">
-        当前用户：{{ userLabel }}<b v-if="userStore">（{{ userStore }}）</b>
-        <button class="mini" @click="showPwd = !showPwd">修改密码</button>
-        <button v-if="isAdmin" class="mini" @click="toggleUsers">用户管理</button>
-        <button v-if="isAdmin" class="mini" @click="showDicts = !showDicts">基础资料</button>
-        <button v-if="isAdmin" class="mini" @click="showSps = !showSps">售货员</button>
-        <button v-if="isAdmin" class="mini" @click="toggleRules">提成规则</button>
-        <button v-if="isAdmin" class="mini" @click="toggleReport">提成报表</button>
-        <button v-if="isAdmin" class="mini" @click="showDists = !showDists">分销商</button>
-        <button class="mini" @click="doLogout">退出登录</button>
-      </p>
+      <!-- 主界面：左侧导航 + 右侧内容 -->
+      <div v-else class="app">
+        <aside class="sidebar">
+          <div class="brand"><Icon name="gem" :size="18" /><span>黄金零售系统</span></div>
+          <nav class="nav">
+            <div v-for="g in visibleNav" :key="g.title" class="nav-group">
+              <div class="nav-title">{{ g.title }}</div>
+              <a v-for="m in g.items" :key="m.key"
+                :class="['nav-item', page === m.key ? 'active' : '']"
+                @click="goPage(m.key)">
+                <Icon :name="m.icon" :size="15" />
+                <span>{{ m.label }}</span>
+                <i v-if="m.todo" class="todo-dot" title="规划中"></i>
+              </a>
+            </div>
+          </nav>
+        </aside>
+
+        <div class="main">
+          <header class="topbar">
+            <div class="gold-ticker">
+              <span v-for="g in goldPrices.slice(0, 3)" :key="g.purity" class="tick">
+                {{ g.purity }} <b>¥{{ g.retailPrice }}</b>
+              </span>
+            </div>
+            <span class="spacer"></span>
+            <span class="who">
+              <Icon name="user" :size="14" />
+              {{ userLabel }}<template v-if="userStore">（{{ userStore }}）</template>
+            </span>
+            <button class="mini" @click="showPwd = !showPwd">修改密码</button>
+            <button class="mini" @click="doLogout"><Icon name="logout" :size="13" /> 退出</button>
+          </header>
+
+          <div class="content">
       <div v-if="showPwd" class="card">
         <div class="row">
           <label>旧密码 <input v-model="oldPwd" type="password" /></label>
@@ -1644,11 +1711,11 @@ function editDoc(d: Doc) {
           <button @click="changePwd">确认修改</button>
         </div>
       </div>
-      <p v-if="okMsg" class="ok">{{ okMsg }}</p>
-      <p v-if="errMsg" class="err">{{ errMsg }}</p>
+      <p v-if="okMsg" class="ok banner">{{ okMsg }}</p>
+      <p v-if="errMsg" class="err banner">{{ errMsg }}</p>
 
       <!-- 基础资料（仅管理员可见） -->
-      <section v-if="isAdmin && showDicts" class="card">
+      <section v-if="isAdmin && page==='dicts'" class="card">
         <h2>
           基础资料
           <button v-for="(label, t) in dictLabels" :key="t" class="mini"
@@ -1680,7 +1747,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 售货员维护（仅管理员可见，v0.14；v0.20加门店/角色/抽成） -->
-      <section v-if="isAdmin && showSps" class="card">
+      <section v-if="isAdmin && page==='salespersons'" class="card">
         <h2>售货员维护</h2>
         <table>
           <thead>
@@ -1736,7 +1803,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 提成规则（仅管理员可见，v0.20；v0.22版本化） -->
-      <section v-if="isAdmin && showRules" class="card">
+      <section v-if="isAdmin && page==='rules'" class="card">
         <h2>提成规则 <button class="mini" @click="loadRules">刷新</button></h2>
         <table>
           <thead>
@@ -1799,7 +1866,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 提成报表（仅管理员可见，v0.21） -->
-      <section v-if="isAdmin && showReport" class="card">
+      <section v-if="isAdmin && page==='report'" class="card">
         <h2>提成报表</h2>
         <div class="row">
           <label>从 <input v-model="crFrom" type="date" /></label>
@@ -1838,7 +1905,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 分销商维护（仅管理员可见，v0.18） -->
-      <section v-if="isAdmin && showDists" class="card">
+      <section v-if="isAdmin && page==='distributors'" class="card">
         <h2>分销商维护</h2>
         <table>
           <thead>
@@ -1865,7 +1932,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 用户管理（仅管理员可见） -->
-      <section v-if="isAdmin && showUsers" class="card">
+      <section v-if="isAdmin && page==='users'" class="card">
         <h2>用户管理 <button class="mini" @click="loadUsers">刷新</button></h2>
         <table>
           <thead>
@@ -1902,7 +1969,7 @@ function editDoc(d: Doc) {
       </section>
 
       <!-- 今日金价（所有人可见；管理员可发布） -->
-      <section class="card">
+      <section v-if="page==='goldprice'" class="card">
         <h2>今日金价 <button class="mini" @click="toggleGpHistory">{{ showGpHistory ? '收起历史' : '调价历史' }}</button></h2>
         <table v-if="goldPrices.length">
           <thead><tr><th>成色</th><th>零售(元/克)</th><th>换新(元/克)</th><th>回收(元/克)</th><th>发布</th></tr></thead>
@@ -1942,6 +2009,8 @@ function editDoc(d: Doc) {
           </tbody>
         </table>
       </section>
+
+      <template v-if="page==='sale'">
 
       <!-- 销售开单 -->
       <section class="card">
@@ -2088,6 +2157,10 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      </template>
+
+      <template v-if="page==='transfer'">
+
       <!-- 调拨单（v0.18） -->
       <section v-if="isHQ" class="card">
         <h2>
@@ -2164,6 +2237,10 @@ function editDoc(d: Doc) {
           </table>
         </div>
       </section>
+
+      </template>
+
+      <template v-if="page==='recycle'">
 
       <!-- 纯旧料回收单（v0.25） -->
       <section class="card">
@@ -2261,6 +2338,10 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      </template>
+
+      <template v-if="page==='saleReturn'">
+
       <!-- 销退单（v0.17） -->
       <section class="card">
         <h2>
@@ -2349,6 +2430,10 @@ function editDoc(d: Doc) {
           </table>
         </div>
       </section>
+
+      </template>
+
+      <template v-if="page==='inbound'">
 
       <!-- 开单表单 -->
       <section v-if="isHQ" class="card">
@@ -2444,6 +2529,10 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      </template>
+
+      <template v-if="page==='outbound'">
+
       <!-- 退库单 -->
       <section v-if="isHQ" class="card">
         <h2>
@@ -2506,6 +2595,10 @@ function editDoc(d: Doc) {
           </table>
         </div>
       </section>
+
+      </template>
+
+      <template v-if="page==='stocktake'">
 
       <!-- 盘点单（v0.23） -->
       <section class="card">
@@ -2598,6 +2691,10 @@ function editDoc(d: Doc) {
         </div>
       </section>
 
+      </template>
+
+      <template v-if="page==='inventory'">
+
       <!-- 库存 -->
       <section class="card">
         <h2>库存查询</h2>
@@ -2652,36 +2749,144 @@ function editDoc(d: Doc) {
         </table>
         <p class="hint" v-if="itemsTotal > items.length">仅显示最新 {{ items.length }} 条，共 {{ itemsTotal }} 条——用筛选缩小范围。</p>
       </section>
-    </template>
-  </main>
+      </template>
+
+      <!-- 规划中的空页面（v0.30 占位） -->
+      <section v-if="placeholderPages[page]" class="card placeholder">
+        <Icon :name="placeholderPages[page].icon" :size="40" />
+        <h2>{{ placeholderPages[page].label }}</h2>
+        <p class="hint">该模块已在规划中，界面先留空，后续版本开放。</p>
+      </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style>
-body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f7; }
-.wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
-h1 { font-size: 20px; }
-.card { background: #fff; border: 1px solid #e2e4e8; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
-.card h2 { font-size: 16px; margin-top: 0; display: flex; gap: 10px; align-items: center; }
-.row { display: flex; gap: 12px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
-label { font-size: 14px; }
-input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
-button { padding: 7px 18px; border: none; border-radius: 4px; background: #2f7d4f; color: #fff; cursor: pointer; font-size: 14px; }
-button.mini { padding: 4px 10px; font-size: 13px; background: #6b7280; }
+/* ===== v0.30 UI壳：深色侧栏 + 金色点缀，紧凑密度(13px)，1600×900 固定画布等比缩放 ===== */
+:root {
+  --sidebar-bg: #182420;      /* 深墨绿近黑 */
+  --sidebar-bg2: #121b18;
+  --gold: #d4af5a;            /* 金色点缀 */
+  --gold-dim: #a8893f;
+  --ink: #1d2823;
+  --content-bg: #eef0ee;
+  --line: #dfe3df;
+  --green: #2f7d4f;
+}
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; padding: 0; width: 100%; height: 100%; }
+body {
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #0d1512; overflow: hidden; font-size: 13px; color: var(--ink);
+}
+
+/* --- 画布：外层铺满窗口，内层固定 1600×900 居中整体缩放 --- */
+.viewport { position: fixed; inset: 0; background: #0d1512; overflow: hidden; }
+.stage {
+  position: absolute; left: 50%; top: 50%;
+  width: 1600px; height: 900px;
+  transform-origin: center center;
+  background: var(--content-bg);
+}
+
+/* --- 登录屏 --- */
+.login-screen {
+  width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(900px 600px at 30% 20%, #243830 0%, var(--sidebar-bg2) 60%, #0d1512 100%);
+}
+.login-card {
+  width: 360px; background: #fff; border-radius: 10px; padding: 36px 40px 30px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.45); display: flex; flex-direction: column; gap: 12px;
+  border-top: 3px solid var(--gold);
+}
+.login-brand { color: var(--gold-dim); text-align: center; }
+.login-title { font-size: 18px; text-align: center; margin: 0 0 8px; letter-spacing: 2px; }
+.login-card label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #555; }
+.login-card input { width: 100%; }
+.login-btn { margin-top: 6px; padding: 9px 0; font-size: 14px; letter-spacing: 6px; }
+
+/* --- 主布局：侧栏 208px + 右侧内容 --- */
+.app { display: flex; width: 100%; height: 100%; }
+.sidebar {
+  width: 208px; flex-shrink: 0; display: flex; flex-direction: column;
+  background: linear-gradient(180deg, var(--sidebar-bg) 0%, var(--sidebar-bg2) 100%);
+  color: #c9d2cc;
+}
+.brand {
+  display: flex; align-items: center; gap: 8px; padding: 16px 18px 14px;
+  color: var(--gold); font-size: 15px; font-weight: 600; letter-spacing: 1px;
+  border-bottom: 1px solid rgba(212,175,90,.18);
+}
+.nav { flex: 1; overflow-y: auto; padding: 8px 0 12px; }
+.nav-group { margin-top: 8px; }
+.nav-title {
+  padding: 6px 18px 4px; font-size: 11px; letter-spacing: 3px;
+  color: rgba(212,175,90,.55);
+}
+.nav-item {
+  display: flex; align-items: center; gap: 9px; padding: 7px 18px;
+  cursor: pointer; font-size: 13px; color: #c9d2cc; user-select: none;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: rgba(255,255,255,.05); color: #fff; }
+.nav-item.active {
+  background: rgba(212,175,90,.12); color: var(--gold);
+  border-left-color: var(--gold); font-weight: 600;
+}
+.todo-dot {
+  width: 5px; height: 5px; border-radius: 50%; background: rgba(201,210,204,.35);
+  margin-left: auto;
+}
+
+/* --- 右侧：顶栏 + 内容区 --- */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  height: 46px; flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+  padding: 0 18px; background: #fff; border-bottom: 1px solid var(--line);
+}
+.gold-ticker { display: flex; gap: 14px; font-size: 12.5px; color: #666; }
+.gold-ticker .tick b { color: var(--gold-dim); font-size: 13.5px; margin-left: 2px; }
+.who { display: flex; align-items: center; gap: 5px; font-size: 13px; color: #444; }
+.content { flex: 1; overflow-y: auto; padding: 14px 18px; }
+
+/* --- 卡片与通用控件（紧凑密度） --- */
+.card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }
+.card h2 { font-size: 14.5px; margin: 0 0 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row { display: flex; gap: 10px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
+label { font-size: 13px; }
+input, select { padding: 4px 7px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; background: #fff; }
+button {
+  padding: 5px 14px; border: none; border-radius: 4px; background: var(--green);
+  color: #fff; cursor: pointer; font-size: 13px;
+  display: inline-flex; align-items: center; gap: 4px; vertical-align: middle;
+}
+button.mini { padding: 3px 9px; font-size: 12px; background: #6b7280; }
 button.gray { background: #4b5563; }
 button.danger { background: #b4552d; }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
-table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0; }
-th, td { border: 1px solid #e2e4e8; padding: 6px 8px; text-align: left; }
-th { background: #f0f2f4; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+th, td { border: 1px solid var(--line); padding: 4px 7px; text-align: left; }
+th { background: #f4f5f3; font-weight: 600; }
 td input { width: 100%; box-sizing: border-box; border: 1px solid #ddd; }
-.hint { color: #888; font-size: 13px; }
-.err { color: #c0392b; font-size: 14px; }
-.ok { color: #2f7d4f; font-size: 14px; font-weight: 600; }
+.hint { color: #888; font-size: 12px; }
+.err { color: #c0392b; font-size: 13px; }
+.ok { color: var(--green); font-size: 13px; font-weight: 600; }
+.banner { background: #fff; border-radius: 6px; padding: 7px 12px; border: 1px solid var(--line); margin: 0 0 10px; }
 .mono { font-family: ui-monospace, Menlo, monospace; }
-.doc { border: 1px solid #e8eaed; border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; }
-.dochead { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.badge { padding: 1px 10px; border-radius: 10px; font-size: 12px; }
+.doc { border: 1px solid #e8eaed; border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; background: #fff; }
+.dochead { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.badge { padding: 1px 9px; border-radius: 10px; font-size: 11.5px; }
 .badge.draft { background: #fdf2d0; color: #8a6d1a; }
 .badge.ok2 { background: #ddf0e3; color: #22663d; }
 .spacer { flex: 1; }
+
+/* --- 规划中的空页面 --- */
+.placeholder {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; min-height: 340px; color: #9aa29c;
+}
+.placeholder h2 { margin: 0; color: #6b736d; }
 </style>
